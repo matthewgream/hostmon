@@ -209,6 +209,15 @@ static bool read_file_uint64(const char *path, uint64_t *val) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static bool ping_host(const char *host) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s >/dev/null 2>&1", host);
+    return system(cmd) == 0;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static char *get_timestamp_iso8601(void) {
     static char buf[32];
     const time_t now = time(NULL);
@@ -217,34 +226,6 @@ static char *get_timestamp_iso8601(void) {
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
-static int discover_interfaces(void) {
-    state.interface_count = 0;
-    DIR *d = opendir("/sys/class/net");
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL && state.interface_count < MAX_INTERFACES) {
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-                continue;
-            if (strcmp(ent->d_name, "lo") == 0)
-                continue;
-            iface_state_t *iface = &state.interfaces[state.interface_count];
-            string_memcpy(iface->name, sizeof(iface->name), ent->d_name);
-            char path[PATH_MAX];
-            snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", ent->d_name);
-            iface->is_wifi = (access(path, F_OK) == 0);
-            iface->was_up = false;
-            iface->prev_ip[0] = '\0';
-            state.interface_count++;
-            if (state.debug)
-                printf("hostmon: discovered interface %s (%s)\n", iface->name, iface->is_wifi ? "wifi" : "ethernet");
-        }
-        closedir(d);
-    }
-    return state.interface_count;
-}
-
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static bool get_iface_operstate(const char *name) {
@@ -369,69 +350,132 @@ static bool get_wifi_frequency(const char *name, char *freq_buf, size_t size) {
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
+
+static int interfaces_discover(void) {
+    state.interface_count = 0;
+    DIR *d = opendir("/sys/class/net");
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && state.interface_count < MAX_INTERFACES) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            if (strcmp(ent->d_name, "lo") == 0)
+                continue;
+            iface_state_t *iface = &state.interfaces[state.interface_count];
+            string_memcpy(iface->name, sizeof(iface->name), ent->d_name);
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", ent->d_name);
+            iface->is_wifi = (access(path, F_OK) == 0);
+            iface->was_up = false;
+            iface->prev_ip[0] = '\0';
+            state.interface_count++;
+            if (state.debug)
+                printf("hostmon: discovered interface %s (%s)\n", iface->name, iface->is_wifi ? "wifi" : "ethernet");
+        }
+        closedir(d);
+    }
+    return state.interface_count;
+}
+
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool get_cpu_temp(double *temp) {
-    // try thermal zones
-    for (int i = 0; i < 10; i++) {
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
-        uint64_t val;
-        if (read_file_uint64(path, &val)) {
-            *temp = (double)val / 1000.0;
-            return true;
+static bool interfaces_check_state_changes(void) {
+    bool changed = false;
+    for (int i = 0; i < state.interface_count; i++) {
+        iface_state_t *iface = &state.interfaces[i];
+        const bool up = get_iface_operstate(iface->name);
+        char ip[INET_ADDRSTRLEN];
+        get_iface_ip(iface->name, ip, sizeof(ip));
+        if (up != iface->was_up) {
+            printf("hostmon: %s link %s -> %s\n", iface->name, iface->was_up ? "up" : "down", up ? "up" : "down");
+            iface->was_up = up;
+            changed = true;
+        }
+        if (strcmp(ip, iface->prev_ip) != 0) {
+            if (iface->prev_ip[0] != '\0' || ip[0] != '\0') {
+                printf("hostmon: %s ip %s -> %s\n", iface->name, iface->prev_ip[0] ? iface->prev_ip : "(none)", ip[0] ? ip : "(none)");
+                changed = true;
+            }
+            snprintf(iface->prev_ip, sizeof(iface->prev_ip), "%s", ip);
         }
     }
-    return false;
+    return changed;
 }
 
-static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t *free_kb) {
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f)
-        return false;
-    char line[128];
-    int found = 0;
-    *total_kb = *available_kb = *free_kb = 0;
-    while (fgets(line, (int)sizeof(line), f) && found < 3) {
-        unsigned long val;
-        if (sscanf(line, "MemTotal: %lu", &val) == 1) {
-            *total_kb = (uint64_t)val;
-            found++;
-        } else if (sscanf(line, "MemAvailable: %lu", &val) == 1) {
-            *available_kb = (uint64_t)val;
-            found++;
-        } else if (sscanf(line, "MemFree: %lu", &val) == 1) {
-            *free_kb = (uint64_t)val;
-            found++;
-        }
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static void interfaces_init(void) {
+    for (int i = 0; i < state.interface_count; i++) {
+        iface_state_t *iface = &state.interfaces[i];
+        iface->was_up = get_iface_operstate(iface->name);
+        get_iface_ip(iface->name, iface->prev_ip, sizeof(iface->prev_ip));
     }
-    fclose(f);
-    return found >= 2;
-}
-
-static bool get_load_averages(double *load1, double *load5, double *load15) {
-    FILE *f = fopen("/proc/loadavg", "r");
-    if (!f)
-        return false;
-    const bool ok = (fscanf(f, "%lf %lf %lf", load1, load5, load15) == 3);
-    fclose(f);
-    return ok;
-}
-
-static bool get_disk_usage(const char *path, uint64_t *total_mb, uint64_t *used_mb, uint64_t *avail_mb) {
-    struct statvfs st;
-    if (statvfs(path, &st) != 0)
-        return false;
-    *total_mb = (uint64_t)st.f_blocks * st.f_frsize / (1024 * 1024);
-    *avail_mb = (uint64_t)st.f_bavail * st.f_frsize / (1024 * 1024);
-    *used_mb = *total_mb - (uint64_t)st.f_bfree * st.f_frsize / (1024 * 1024);
-    return true;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static cJSON *build_timesync_json(void) {
+static cJSON *interfaces_build_json(const iface_state_t *iface) {
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "name", iface->name);
+    cJSON_AddStringToObject(obj, "type", iface->is_wifi ? "wifi" : "ethernet");
+
+    const bool up = get_iface_operstate(iface->name);
+    cJSON_AddBoolToObject(obj, "up", up);
+
+    char ip[INET_ADDRSTRLEN];
+    if (get_iface_ip(iface->name, ip, sizeof(ip)))
+        cJSON_AddStringToObject(obj, "ip", ip);
+
+    int mtu;
+    if (get_iface_mtu(iface->name, &mtu))
+        cJSON_AddNumberToObject(obj, "mtu", mtu);
+
+    if (!iface->is_wifi) {
+        int speed;
+        if (get_iface_speed(iface->name, &speed))
+            cJSON_AddNumberToObject(obj, "speed_mbps", speed);
+        char duplex[16];
+        if (get_iface_duplex(iface->name, duplex, sizeof(duplex)))
+            cJSON_AddStringToObject(obj, "duplex", duplex);
+    } else {
+        char ssid[64];
+        if (get_wifi_ssid(iface->name, ssid, sizeof(ssid)))
+            cJSON_AddStringToObject(obj, "ssid", ssid);
+        int sig;
+        if (get_wifi_signal(iface->name, &sig))
+            cJSON_AddNumberToObject(obj, "signal_dbm", sig);
+        char freq[32];
+        if (get_wifi_frequency(iface->name, freq, sizeof(freq)))
+            cJSON_AddStringToObject(obj, "frequency", freq);
+    }
+
+    // counters
+    uint64_t val;
+    if (get_iface_counter(iface->name, "rx_bytes", &val))
+        cJSON_AddNumberToObject(obj, "rx_bytes", (double)val);
+    if (get_iface_counter(iface->name, "tx_bytes", &val))
+        cJSON_AddNumberToObject(obj, "tx_bytes", (double)val);
+    if (get_iface_counter(iface->name, "rx_packets", &val))
+        cJSON_AddNumberToObject(obj, "rx_packets", (double)val);
+    if (get_iface_counter(iface->name, "tx_packets", &val))
+        cJSON_AddNumberToObject(obj, "tx_packets", (double)val);
+    if (get_iface_counter(iface->name, "rx_errors", &val))
+        cJSON_AddNumberToObject(obj, "rx_errors", (double)val);
+    if (get_iface_counter(iface->name, "tx_errors", &val))
+        cJSON_AddNumberToObject(obj, "tx_errors", (double)val);
+    if (get_iface_counter(iface->name, "rx_dropped", &val))
+        cJSON_AddNumberToObject(obj, "rx_dropped", (double)val);
+    if (get_iface_counter(iface->name, "tx_dropped", &val))
+        cJSON_AddNumberToObject(obj, "tx_dropped", (double)val);
+
+    return obj;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *timesync_build_json(void) {
     cJSON *timesync = cJSON_CreateObject();
 
     // try timedatectl (systemd-timesyncd)
@@ -481,30 +525,6 @@ static cJSON *build_timesync_json(void) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static void parse_processes(const char *csv) {
-    if (!csv || !*csv)
-        return;
-    char buf[1024];
-    string_memcpy(buf, sizeof(buf), csv);
-    char *saveptr = NULL, *tok = strtok_r(buf, ",", &saveptr);
-    while (tok && state.processes_count < MAX_PROCESSES) {
-        while (*tok == ' ')
-            tok++;
-        char *end = tok + strlen(tok) - 1;
-        while (end > tok && *end == ' ')
-            *end-- = '\0';
-        if (*tok) {
-            proc_watch_t *pw = &state.processes[state.processes_count];
-            string_memcpy(pw->name, sizeof(pw->name), tok);
-            pw->was_running = false;
-            state.processes_count++;
-        }
-        tok = strtok_r(NULL, ",", &saveptr);
-    }
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
 static bool is_process_running(const char *name, int *pid_out, unsigned long *rss_kb_out) {
     *pid_out = 0;
     *rss_kb_out = 0;
@@ -545,7 +565,60 @@ static bool is_process_running(const char *name, int *pid_out, unsigned long *rs
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static cJSON *build_processes_json(void) {
+static void processes_parse(const char *csv) {
+    if (!csv || !*csv)
+        return;
+    char buf[1024];
+    string_memcpy(buf, sizeof(buf), csv);
+    char *saveptr = NULL, *tok = strtok_r(buf, ",", &saveptr);
+    while (tok && state.processes_count < MAX_PROCESSES) {
+        while (*tok == ' ')
+            tok++;
+        char *end = tok + strlen(tok) - 1;
+        while (end > tok && *end == ' ')
+            *end-- = '\0';
+        if (*tok) {
+            proc_watch_t *pw = &state.processes[state.processes_count];
+            string_memcpy(pw->name, sizeof(pw->name), tok);
+            pw->was_running = false;
+            state.processes_count++;
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool processes_check_state_changes(void) {
+    bool changed = false;
+    for (int i = 0; i < state.processes_count; i++) {
+        int pid;
+        unsigned long rss_kb;
+        const bool running_now = is_process_running(state.processes[i].name, &pid, &rss_kb);
+        if (running_now != state.processes[i].was_running) {
+            printf("hostmon: process '%s' %s -> %s\n", state.processes[i].name, state.processes[i].was_running ? "running" : "stopped", running_now ? "running" : "stopped");
+            state.processes[i].was_running = running_now;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static void processes_init(void) {
+    for (int i = 0; i < state.processes_count; i++) {
+        int pid;
+        unsigned long rss_kb;
+        state.processes[i].was_running = is_process_running(state.processes[i].name, &pid, &rss_kb);
+        printf("hostmon: watching process '%s' (%s)\n", state.processes[i].name, state.processes[i].was_running ? "running" : "not found");
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *processes_build_json(void) {
     if (state.processes_count == 0)
         return NULL;
     cJSON *arr = cJSON_CreateArray();
@@ -615,31 +688,92 @@ static cJSON *build_processes_json(void) {
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool processes_check_state_changes(void) {
-    bool changed = false;
-    for (int i = 0; i < state.processes_count; i++) {
-        int pid;
-        unsigned long rss_kb;
-        const bool running_now = is_process_running(state.processes[i].name, &pid, &rss_kb);
-        if (running_now != state.processes[i].was_running) {
-            printf("hostmon: process '%s' %s -> %s\n", state.processes[i].name, state.processes[i].was_running ? "running" : "stopped", running_now ? "running" : "stopped");
-            state.processes[i].was_running = running_now;
-            changed = true;
+static bool get_cpu_temp(double *temp) {
+    // try thermal zones
+    for (int i = 0; i < 10; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
+        uint64_t val;
+        if (read_file_uint64(path, &val)) {
+            *temp = (double)val / 1000.0;
+            return true;
         }
     }
-    return changed;
+    return false;
+}
+
+static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t *free_kb) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f)
+        return false;
+    char line[128];
+    int found = 0;
+    *total_kb = *available_kb = *free_kb = 0;
+    while (fgets(line, (int)sizeof(line), f) && found < 3) {
+        unsigned long val;
+        if (sscanf(line, "MemTotal: %lu", &val) == 1) {
+            *total_kb = (uint64_t)val;
+            found++;
+        } else if (sscanf(line, "MemAvailable: %lu", &val) == 1) {
+            *available_kb = (uint64_t)val;
+            found++;
+        } else if (sscanf(line, "MemFree: %lu", &val) == 1) {
+            *free_kb = (uint64_t)val;
+            found++;
+        }
+    }
+    fclose(f);
+    return found >= 2;
+}
+
+static bool get_load_averages(double *load1, double *load5, double *load15) {
+    FILE *f = fopen("/proc/loadavg", "r");
+    if (!f)
+        return false;
+    const bool ok = (fscanf(f, "%lf %lf %lf", load1, load5, load15) == 3);
+    fclose(f);
+    return ok;
+}
+
+static bool get_disk_usage(const char *path, uint64_t *total_mb, uint64_t *used_mb, uint64_t *avail_mb) {
+    struct statvfs st;
+    if (statvfs(path, &st) != 0)
+        return false;
+    *total_mb = (uint64_t)st.f_blocks * st.f_frsize / (1024 * 1024);
+    *avail_mb = (uint64_t)st.f_bavail * st.f_frsize / (1024 * 1024);
+    *used_mb = *total_mb - (uint64_t)st.f_bfree * st.f_frsize / (1024 * 1024);
+    return true;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
 
-void processes_init(void) {
-    for (int i = 0; i < state.processes_count; i++) {
-        int pid;
-        unsigned long rss_kb;
-        state.processes[i].was_running = is_process_running(state.processes[i].name, &pid, &rss_kb);
-        printf("hostmon: watching process '%s' (%s)\n", state.processes[i].name, state.processes[i].was_running ? "running" : "not found");
-    }
+static bool is_filesystem_readonly(const char *mountpoint) {
+    struct statvfs st;
+    if (statvfs(mountpoint, &st) != 0)
+        return false;
+    return (st.f_flag & ST_RDONLY) != 0;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool check_dns_resolution(const char *hostname, char *result_ip, size_t result_size) {
+    result_ip[0] = '\0';
+    if (!hostname || !*hostname)
+        return false;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(hostname, NULL, &hints, &res) != 0)
+        return false;
+    if (res && res->ai_addr)
+        inet_ntop(AF_INET, &((const struct sockaddr_in *)res->ai_addr)->sin_addr, result_ip, (socklen_t)result_size);
+    freeaddrinfo(res);
+    return result_ip[0] != '\0';
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -671,46 +805,9 @@ static bool get_default_gateway(char *gw_buf, size_t gw_size) {
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
-
-static bool ping_host(const char *host) {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s >/dev/null 2>&1", host);
-    return system(cmd) == 0;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool check_dns_resolution(const char *hostname, char *result_ip, size_t result_size) {
-    result_ip[0] = '\0';
-    if (!hostname || !*hostname)
-        return false;
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(hostname, NULL, &hints, &res) != 0)
-        return false;
-    if (res && res->ai_addr)
-        inet_ntop(AF_INET, &((const struct sockaddr_in *)res->ai_addr)->sin_addr, result_ip, (socklen_t)result_size);
-    freeaddrinfo(res);
-    return result_ip[0] != '\0';
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
-static bool is_filesystem_readonly(const char *mountpoint) {
-    struct statvfs st;
-    if (statvfs(mountpoint, &st) != 0)
-        return false;
-    return (st.f_flag & ST_RDONLY) != 0;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
-static cJSON *build_usb_json(void) {
+static cJSON *usbdevs_build_json(void) {
     cJSON *arr = cJSON_CreateArray();
     DIR *d = opendir("/sys/bus/usb/devices");
     if (d) {
@@ -748,6 +845,116 @@ static cJSON *build_usb_json(void) {
         closedir(d);
     }
     return arr;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *build_system_json(void) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "timestamp", get_timestamp_iso8601());
+    cJSON_AddStringToObject(root, "type", "system");
+
+    // show uptime
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        cJSON_AddNumberToObject(root, "uptime_secs", (double)si.uptime);
+        char upstr[64];
+        snprintf(upstr, sizeof(upstr), "%dd %dh %dm", (int)(si.uptime / 86400), (int)((si.uptime % 86400) / 3600), (int)((si.uptime % 3600) / 60));
+        cJSON_AddStringToObject(root, "uptime", upstr);
+    }
+
+    // show temp
+    double temp;
+    if (get_cpu_temp(&temp))
+        cJSON_AddNumberToObject(root, "cpu_temp_c", round(temp * 10.0) / 10.0);
+
+    // show load
+    double l1, l5, l15;
+    if (get_load_averages(&l1, &l5, &l15)) {
+        cJSON *load = cJSON_AddObjectToObject(root, "load");
+        cJSON_AddNumberToObject(load, "1min", l1);
+        cJSON_AddNumberToObject(load, "5min", l5);
+        cJSON_AddNumberToObject(load, "15min", l15);
+    }
+
+    // show memory
+    uint64_t mem_total, mem_avail, mem_free;
+    if (get_memory_info(&mem_total, &mem_avail, &mem_free)) {
+        cJSON *mem = cJSON_AddObjectToObject(root, "memory");
+        cJSON_AddNumberToObject(mem, "total_kb", (double)mem_total);
+        cJSON_AddNumberToObject(mem, "available_kb", (double)mem_avail);
+        cJSON_AddNumberToObject(mem, "free_kb", (double)mem_free);
+        if (mem_total > 0)
+            cJSON_AddNumberToObject(mem, "used_pct", round(1000.0 * (double)(mem_total - mem_avail) / (double)mem_total) / 10.0);
+    }
+
+    // show network interfaces
+    cJSON *ifaces = cJSON_AddArrayToObject(root, "network");
+    for (int i = 0; i < state.interface_count; i++)
+        cJSON_AddItemToArray(ifaces, interfaces_build_json(&state.interfaces[i]));
+
+    // show mqtt connection status
+    cJSON *mq = cJSON_AddObjectToObject(root, "mqtt");
+    cJSON_AddBoolToObject(mq, "connected", mqtt_is_connected());
+    cJSON_AddNumberToObject(mq, "disconnects", (double)mqtt_stat_disconnects);
+
+    // show disk usage (root filesystem)
+    uint64_t disk_total, disk_used, disk_avail;
+    if (get_disk_usage("/", &disk_total, &disk_used, &disk_avail)) {
+        cJSON *disk = cJSON_AddObjectToObject(root, "disk");
+        cJSON_AddNumberToObject(disk, "total_mb", (double)disk_total);
+        cJSON_AddNumberToObject(disk, "used_mb", (double)disk_used);
+        cJSON_AddNumberToObject(disk, "avail_mb", (double)disk_avail);
+        if (disk_total > 0)
+            cJSON_AddNumberToObject(disk, "used_pct", round(1000.0 * (double)disk_used / (double)disk_total) / 10.0);
+        cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
+    }
+
+    // show USB devices
+    cJSON *usbdevs = usbdevs_build_json();
+    if (usbdevs)
+        cJSON_AddItemToObject(root, "usb", usbdevs);
+
+    // check processes
+    if (state.processes_count > 0) {
+        cJSON *procs = processes_build_json();
+        if (procs)
+            cJSON_AddItemToObject(root, "processes", procs);
+    }
+
+    // check time synchronisation
+    if (state.check_timesync) {
+        cJSON *timesync = timesync_build_json();
+        if (timesync)
+            cJSON_AddItemToObject(root, "timesync", timesync);
+    }
+
+    // check gateway reachability
+    if (state.check_gateway) {
+        cJSON *gw = cJSON_AddObjectToObject(root, "gateway");
+        char gw_ip[INET_ADDRSTRLEN];
+        if (get_default_gateway(gw_ip, sizeof(gw_ip))) {
+            cJSON_AddStringToObject(gw, "ip", gw_ip);
+            cJSON_AddBoolToObject(gw, "reachable", ping_host(gw_ip));
+        } else {
+            cJSON_AddStringToObject(gw, "ip", "none");
+            cJSON_AddBoolToObject(gw, "reachable", false);
+        }
+    }
+
+    // check DNS resolution
+    if (state.check_dns && *state.check_dns) {
+        cJSON *dns = cJSON_AddObjectToObject(root, "dns");
+        cJSON_AddStringToObject(dns, "check_host", state.check_dns);
+        char resolved_ip[INET_ADDRSTRLEN];
+        const bool resolved = check_dns_resolution(state.check_dns, resolved_ip, sizeof(resolved_ip));
+        cJSON_AddBoolToObject(dns, "ok", resolved);
+        if (resolved)
+            cJSON_AddStringToObject(dns, "resolved_ip", resolved_ip);
+    }
+
+    return root;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -814,174 +1021,6 @@ static cJSON *build_platform_json(void) {
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
-
-static cJSON *build_interface_json(const iface_state_t *iface) {
-    cJSON *obj = cJSON_CreateObject();
-    cJSON_AddStringToObject(obj, "name", iface->name);
-    cJSON_AddStringToObject(obj, "type", iface->is_wifi ? "wifi" : "ethernet");
-
-    const bool up = get_iface_operstate(iface->name);
-    cJSON_AddBoolToObject(obj, "up", up);
-
-    char ip[INET_ADDRSTRLEN];
-    if (get_iface_ip(iface->name, ip, sizeof(ip)))
-        cJSON_AddStringToObject(obj, "ip", ip);
-
-    int mtu;
-    if (get_iface_mtu(iface->name, &mtu))
-        cJSON_AddNumberToObject(obj, "mtu", mtu);
-
-    if (!iface->is_wifi) {
-        int speed;
-        if (get_iface_speed(iface->name, &speed))
-            cJSON_AddNumberToObject(obj, "speed_mbps", speed);
-        char duplex[16];
-        if (get_iface_duplex(iface->name, duplex, sizeof(duplex)))
-            cJSON_AddStringToObject(obj, "duplex", duplex);
-    } else {
-        char ssid[64];
-        if (get_wifi_ssid(iface->name, ssid, sizeof(ssid)))
-            cJSON_AddStringToObject(obj, "ssid", ssid);
-        int sig;
-        if (get_wifi_signal(iface->name, &sig))
-            cJSON_AddNumberToObject(obj, "signal_dbm", sig);
-        char freq[32];
-        if (get_wifi_frequency(iface->name, freq, sizeof(freq)))
-            cJSON_AddStringToObject(obj, "frequency", freq);
-    }
-
-    // counters
-    uint64_t val;
-    if (get_iface_counter(iface->name, "rx_bytes", &val))
-        cJSON_AddNumberToObject(obj, "rx_bytes", (double)val);
-    if (get_iface_counter(iface->name, "tx_bytes", &val))
-        cJSON_AddNumberToObject(obj, "tx_bytes", (double)val);
-    if (get_iface_counter(iface->name, "rx_packets", &val))
-        cJSON_AddNumberToObject(obj, "rx_packets", (double)val);
-    if (get_iface_counter(iface->name, "tx_packets", &val))
-        cJSON_AddNumberToObject(obj, "tx_packets", (double)val);
-    if (get_iface_counter(iface->name, "rx_errors", &val))
-        cJSON_AddNumberToObject(obj, "rx_errors", (double)val);
-    if (get_iface_counter(iface->name, "tx_errors", &val))
-        cJSON_AddNumberToObject(obj, "tx_errors", (double)val);
-    if (get_iface_counter(iface->name, "rx_dropped", &val))
-        cJSON_AddNumberToObject(obj, "rx_dropped", (double)val);
-    if (get_iface_counter(iface->name, "tx_dropped", &val))
-        cJSON_AddNumberToObject(obj, "tx_dropped", (double)val);
-
-    return obj;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
-static cJSON *build_system_json(void) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "timestamp", get_timestamp_iso8601());
-    cJSON_AddStringToObject(root, "type", "system");
-
-    // show uptime
-    struct sysinfo si;
-    if (sysinfo(&si) == 0) {
-        cJSON_AddNumberToObject(root, "uptime_secs", (double)si.uptime);
-        char upstr[64];
-        snprintf(upstr, sizeof(upstr), "%dd %dh %dm", (int)(si.uptime / 86400), (int)((si.uptime % 86400) / 3600), (int)((si.uptime % 3600) / 60));
-        cJSON_AddStringToObject(root, "uptime", upstr);
-    }
-
-    // show temp
-    double temp;
-    if (get_cpu_temp(&temp))
-        cJSON_AddNumberToObject(root, "cpu_temp_c", round(temp * 10.0) / 10.0);
-
-    // show load
-    double l1, l5, l15;
-    if (get_load_averages(&l1, &l5, &l15)) {
-        cJSON *load = cJSON_AddObjectToObject(root, "load");
-        cJSON_AddNumberToObject(load, "1min", l1);
-        cJSON_AddNumberToObject(load, "5min", l5);
-        cJSON_AddNumberToObject(load, "15min", l15);
-    }
-
-    // show memory
-    uint64_t mem_total, mem_avail, mem_free;
-    if (get_memory_info(&mem_total, &mem_avail, &mem_free)) {
-        cJSON *mem = cJSON_AddObjectToObject(root, "memory");
-        cJSON_AddNumberToObject(mem, "total_kb", (double)mem_total);
-        cJSON_AddNumberToObject(mem, "available_kb", (double)mem_avail);
-        cJSON_AddNumberToObject(mem, "free_kb", (double)mem_free);
-        if (mem_total > 0)
-            cJSON_AddNumberToObject(mem, "used_pct", round(1000.0 * (double)(mem_total - mem_avail) / (double)mem_total) / 10.0);
-    }
-
-    // show network interfaces
-    cJSON *ifaces = cJSON_AddArrayToObject(root, "network");
-    for (int i = 0; i < state.interface_count; i++)
-        cJSON_AddItemToArray(ifaces, build_interface_json(&state.interfaces[i]));
-
-    // show mqtt connection status
-    cJSON *mq = cJSON_AddObjectToObject(root, "mqtt");
-    cJSON_AddBoolToObject(mq, "connected", mqtt_is_connected());
-    cJSON_AddNumberToObject(mq, "disconnects", (double)mqtt_stat_disconnects);
-
-    // show disk usage (root filesystem)
-    uint64_t disk_total, disk_used, disk_avail;
-    if (get_disk_usage("/", &disk_total, &disk_used, &disk_avail)) {
-        cJSON *disk = cJSON_AddObjectToObject(root, "disk");
-        cJSON_AddNumberToObject(disk, "total_mb", (double)disk_total);
-        cJSON_AddNumberToObject(disk, "used_mb", (double)disk_used);
-        cJSON_AddNumberToObject(disk, "avail_mb", (double)disk_avail);
-        if (disk_total > 0)
-            cJSON_AddNumberToObject(disk, "used_pct", round(1000.0 * (double)disk_used / (double)disk_total) / 10.0);
-        cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
-    }
-
-    // show USB devices
-    cJSON *usb = build_usb_json();
-    if (usb)
-        cJSON_AddItemToObject(root, "usb", usb);
-
-    // check processes
-    if (state.processes_count > 0) {
-        cJSON *procs = build_processes_json();
-        if (procs)
-            cJSON_AddItemToObject(root, "processes", procs);
-    }
-
-    // check time synchronisation
-    if (state.check_timesync) {
-        cJSON *timesync = build_timesync_json();
-        if (timesync)
-            cJSON_AddItemToObject(root, "timesync", timesync);
-    }
-
-    // check gateway reachability
-    if (state.check_gateway) {
-        cJSON *gw = cJSON_AddObjectToObject(root, "gateway");
-        char gw_ip[INET_ADDRSTRLEN];
-        if (get_default_gateway(gw_ip, sizeof(gw_ip))) {
-            cJSON_AddStringToObject(gw, "ip", gw_ip);
-            cJSON_AddBoolToObject(gw, "reachable", ping_host(gw_ip));
-        } else {
-            cJSON_AddStringToObject(gw, "ip", "none");
-            cJSON_AddBoolToObject(gw, "reachable", false);
-        }
-    }
-
-    // check DNS resolution
-    if (state.check_dns && *state.check_dns) {
-        cJSON *dns = cJSON_AddObjectToObject(root, "dns");
-        cJSON_AddStringToObject(dns, "check_host", state.check_dns);
-        char resolved_ip[INET_ADDRSTRLEN];
-        const bool resolved = check_dns_resolution(state.check_dns, resolved_ip, sizeof(resolved_ip));
-        cJSON_AddBoolToObject(dns, "ok", resolved);
-        if (resolved)
-            cJSON_AddStringToObject(dns, "resolved_ip", resolved_ip);
-    }
-
-    return root;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static bool publish_json(const char *subtopic, cJSON *json) {
@@ -1003,42 +1042,6 @@ static bool publish_json(const char *subtopic, cJSON *json) {
     free(str);
     cJSON_Delete(json);
     return ok;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
-static bool interfaces_check_state_changes(void) {
-    bool changed = false;
-    for (int i = 0; i < state.interface_count; i++) {
-        iface_state_t *iface = &state.interfaces[i];
-        const bool up = get_iface_operstate(iface->name);
-        char ip[INET_ADDRSTRLEN];
-        get_iface_ip(iface->name, ip, sizeof(ip));
-        if (up != iface->was_up) {
-            printf("hostmon: %s link %s -> %s\n", iface->name, iface->was_up ? "up" : "down", up ? "up" : "down");
-            iface->was_up = up;
-            changed = true;
-        }
-        if (strcmp(ip, iface->prev_ip) != 0) {
-            if (iface->prev_ip[0] != '\0' || ip[0] != '\0') {
-                printf("hostmon: %s ip %s -> %s\n", iface->name, iface->prev_ip[0] ? iface->prev_ip : "(none)", ip[0] ? ip : "(none)");
-                changed = true;
-            }
-            snprintf(iface->prev_ip, sizeof(iface->prev_ip), "%s", ip);
-        }
-    }
-    return changed;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
-void interfaces_init(void) {
-    for (int i = 0; i < state.interface_count; i++) {
-        iface_state_t *iface = &state.interfaces[i];
-        iface->was_up = get_iface_operstate(iface->name);
-        get_iface_ip(iface->name, iface->prev_ip, sizeof(iface->prev_ip));
-    }
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -1077,11 +1080,11 @@ static void hostmon_run(void) {
 
         bool forced = false;
         if (interfaces_check_state_changes()) {
-            printf("hostmon: network state change, publishing immediately\n");
+            printf("hostmon: network state changes, publishing immediately\n");
             forced = true;
         }
         if (processes_check_state_changes()) {
-            printf("hostmon: process state change, publishing immediately\n");
+            printf("hostmon: process state changes, publishing immediately\n");
             forced = true;
         }
 
@@ -1112,6 +1115,8 @@ static void mqtt_config_populate(mqtt_config_t *cfg) {
     printf("config: mqtt: server=%s, client=%s\n", cfg->server, cfg->client);
 }
 
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static bool config_setup(const int argc, char *argv[]) {
     for (int i = 1; i < argc; i++)
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -1128,7 +1133,7 @@ static bool config_setup(const int argc, char *argv[]) {
     state.interval_system = (time_t)config_get_integer("interval-system", INTERVAL_SYSTEM_DEFAULT);
     const char *processes_csv = config_get_string("check-processes", NULL);
     if (processes_csv)
-        parse_processes(processes_csv);
+        processes_parse(processes_csv);
     state.check_timesync = config_get_bool("check-timesync", true);
     state.check_gateway = config_get_bool("check-gateway", true);
     state.check_dns = config_get_string("check-dns", NULL);
@@ -1159,7 +1164,7 @@ int main(int argc, char *argv[]) {
     if (!config_setup(argc, argv))
         return EXIT_FAILURE;
 
-    if (!discover_interfaces())
+    if (!interfaces_discover())
         printf("hostmon: WARNING no network interfaces discovered\n");
 
     if (!mqtt_begin(&state.mqtt_config))
