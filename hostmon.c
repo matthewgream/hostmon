@@ -294,7 +294,7 @@ static bool get_iface_mtu(const char *name, int *mtu) {
 static bool get_wifi_ssid(const char *name, char *ssid, size_t size) {
     ssid[0] = '\0';
     char cmd[128], buf[256];
-    snprintf(cmd, sizeof(cmd), "iwgetid -r %s 2>/dev/null", name);
+    snprintf(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/ssid/{print $2}'", name);
     FILE *f = popen(cmd, "r");
     if (!f)
         return false;
@@ -332,19 +332,12 @@ static bool get_wifi_signal(const char *name, int *signal_dbm) {
 static bool get_wifi_frequency(const char *name, char *freq_buf, size_t size) {
     freq_buf[0] = '\0';
     char cmd[128], buf[256];
-    snprintf(cmd, sizeof(cmd), "iwgetid -f %s 2>/dev/null", name);
+    snprintf(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/channel/{print $2\"ch \"$5\" MHz\"}'", name);
     FILE *f = popen(cmd, "r");
     if (!f)
         return false;
-    if (fgets(buf, (int)sizeof(buf), f)) {
-        char *colon = strchr(buf, ':');
-        if (colon) {
-            colon++;
-            while (*colon == ' ')
-                colon++;
-            snprintf(freq_buf, size, "%s", string_cleanup(colon));
-        }
-    }
+    if (fgets(buf, (int)sizeof(buf), f))
+        snprintf(freq_buf, size, "%s", string_cleanup(buf));
     pclose(f);
     return freq_buf[0] != '\0';
 }
