@@ -29,27 +29,29 @@
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <ctype.h>
 #include <time.h>
-#include <errno.h>
-#include <dirent.h>
-#include <limits.h>
+#include <unistd.h>
 
-#include <sys/utsname.h>
-#include <sys/sysinfo.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <net/if.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/statvfs.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
 
 #include <cjson/cJSON.h>
 
@@ -58,9 +60,8 @@ volatile bool running = true;
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-// stub out serial_bits_t so config_linux.h compiles without serial_linux.h
 typedef int serial_bits_t;
-#define SERIAL_8N1 0
+#define SERIAL_8N1           0
 
 #define MQTT_CONNECT_TIMEOUT 60
 #define MQTT_PUBLISH_QOS     0
@@ -80,8 +81,8 @@ typedef int serial_bits_t;
 #define MQTT_RECONNECT_DELAY_DEFAULT     5
 #define MQTT_RECONNECT_DELAY_MAX_DEFAULT 60
 
-#define INTERVAL_PLATFORM_DEFAULT            (24 * 60 * 60)
-#define INTERVAL_SYSTEM_DEFAULT        60
+#define INTERVAL_PLATFORM_DEFAULT        (24 * 60 * 60)
+#define INTERVAL_SYSTEM_DEFAULT          60
 
 #include "config_linux.h"
 
@@ -97,6 +98,8 @@ const struct option config_options[] = {
     {"mqtt-reconnect-delay-max",    required_argument, 0, 0},
     {"interval-platform",           required_argument, 0, 0},
     {"interval-system",             required_argument, 0, 0},
+    {"watch-processes",             required_argument, 0, 0},
+    {"dns-check-host",              required_argument, 0, 0},
     {"debug",                       required_argument, 0, 0},
     {0, 0, 0, 0}
 };
@@ -112,6 +115,8 @@ const config_option_help_t config_options_help[] = {
     {"mqtt-reconnect-delay-max","MQTT max reconnect delay in seconds"},
     {"interval-platform",       "Platform info publish interval in seconds (default: 86400)"},
     {"interval-system",         "System info publish interval in seconds (default: 60)"},
+    {"watch-processes",         "Comma-separated list of process names to monitor"},
+    {"dns-check-host",          "Hostname to resolve for DNS health check"},
     {"debug",                   "Enable debug output (true/false)"},
 };
 // clang-format on
@@ -119,9 +124,11 @@ const config_option_help_t config_options_help[] = {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-#define MAX_INTERFACES 8
-#define IFACE_NAME_MAX 32
-#define TOPIC_MAX      255
+#define MAX_INTERFACES  8
+#define MAX_WATCH_PROCS 16
+#define IFACE_NAME_MAX  32
+#define PROC_NAME_MAX   64
+#define TOPIC_MAX       255
 
 typedef struct {
     char name[IFACE_NAME_MAX];
@@ -129,6 +136,11 @@ typedef struct {
     bool was_up;
     char prev_ip[INET_ADDRSTRLEN];
 } iface_state_t;
+
+typedef struct {
+    char name[PROC_NAME_MAX];
+    bool was_running;
+} proc_watch_t;
 
 typedef struct {
     const char *mqtt_topic_prefix;
@@ -140,6 +152,9 @@ typedef struct {
     bool debug;
     iface_state_t interfaces[MAX_INTERFACES];
     int interface_count;
+    proc_watch_t watch_procs[MAX_WATCH_PROCS];
+    int watch_proc_count;
+    const char *dns_check_host;
 } hostmon_state_t;
 
 static hostmon_state_t state;
@@ -301,8 +316,14 @@ static bool get_wifi_signal(const char *name, int *signal_dbm) {
         return false;
     char line[256];
     // skip header lines
-    if (!fgets(line, (int)sizeof(line), f)) { fclose(f); return false; }
-    if (!fgets(line, (int)sizeof(line), f)) { fclose(f); return false; }
+    if (!fgets(line, (int)sizeof(line), f)) {
+        fclose(f);
+        return false;
+    }
+    if (!fgets(line, (int)sizeof(line), f)) {
+        fclose(f);
+        return false;
+    }
     bool found = false;
     while (fgets(line, (int)sizeof(line), f)) {
         char iface[IFACE_NAME_MAX];
@@ -331,7 +352,8 @@ static bool get_wifi_frequency(const char *name, char *freq_buf, size_t size) {
         char *colon = strchr(buf, ':');
         if (colon) {
             colon++;
-            while (*colon == ' ') colon++;
+            while (*colon == ' ')
+                colon++;
             size_t len = strlen(colon);
             while (len > 0 && (colon[len - 1] == '\n' || colon[len - 1] == '\r'))
                 colon[--len] = '\0';
@@ -368,9 +390,16 @@ static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t
     *total_kb = *available_kb = *free_kb = 0;
     while (fgets(line, (int)sizeof(line), f) && found < 3) {
         uint64_t val;
-        if (sscanf(line, "MemTotal: %lu", (unsigned long *)&val) == 1) { *total_kb = val; found++; }
-        else if (sscanf(line, "MemAvailable: %lu", (unsigned long *)&val) == 1) { *available_kb = val; found++; }
-        else if (sscanf(line, "MemFree: %lu", (unsigned long *)&val) == 1) { *free_kb = val; found++; }
+        if (sscanf(line, "MemTotal: %lu", (unsigned long *)&val) == 1) {
+            *total_kb = val;
+            found++;
+        } else if (sscanf(line, "MemAvailable: %lu", (unsigned long *)&val) == 1) {
+            *available_kb = val;
+            found++;
+        } else if (sscanf(line, "MemFree: %lu", (unsigned long *)&val) == 1) {
+            *free_kb = val;
+            found++;
+        }
     }
     fclose(f);
     return found >= 2;
@@ -393,6 +422,347 @@ static bool get_disk_usage(const char *path, uint64_t *total_mb, uint64_t *used_
     *avail_mb = (uint64_t)st.f_bavail * st.f_frsize / (1024 * 1024);
     *used_mb = *total_mb - (uint64_t)st.f_bfree * st.f_frsize / (1024 * 1024);
     return true;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *build_ntp_json(void) {
+    cJSON *ntp = cJSON_CreateObject();
+
+    // try timedatectl (systemd-timesyncd)
+    FILE *f = popen("timedatectl show --property=NTPSynchronized --value 2>/dev/null", "r");
+    if (f) {
+        char buf[32];
+        if (fgets(buf, (int)sizeof(buf), f)) {
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+                buf[--len] = '\0';
+            cJSON_AddBoolToObject(ntp, "synchronized", strcmp(buf, "yes") == 0);
+        }
+        pclose(f);
+    }
+
+    // try chronyc for offset
+    f = popen("chronyc tracking 2>/dev/null", "r");
+    if (f) {
+        char line[256];
+        bool found_source = false;
+        while (fgets(line, (int)sizeof(line), f)) {
+            if (!found_source && strncmp(line, "Reference ID", 12) == 0) {
+                char *paren = strchr(line, '(');
+                if (paren) {
+                    char *end = strchr(paren + 1, ')');
+                    if (end) {
+                        *end = '\0';
+                        cJSON_AddStringToObject(ntp, "source", paren + 1);
+                        found_source = true;
+                    }
+                }
+            }
+            double offset_val;
+            if (strncmp(line, "Last offset", 11) == 0) {
+                char *colon = strchr(line, ':');
+                if (colon && sscanf(colon + 1, " %lf", &offset_val) == 1)
+                    cJSON_AddNumberToObject(ntp, "offset_secs", offset_val);
+            }
+            if (strncmp(line, "Stratum", 7) == 0) {
+                char *colon = strchr(line, ':');
+                if (colon) {
+                    int stratum = atoi(colon + 1);
+                    cJSON_AddNumberToObject(ntp, "stratum", stratum);
+                }
+            }
+        }
+        pclose(f);
+    }
+
+    return ntp;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static void parse_watch_processes(const char *csv) {
+    if (!csv || !*csv)
+        return;
+    char buf[1024];
+    size_t csv_len = strlen(csv);
+    if (csv_len >= sizeof(buf))
+        csv_len = sizeof(buf) - 1;
+    memcpy(buf, csv, csv_len);
+    buf[csv_len] = '\0';
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    while (tok && state.watch_proc_count < MAX_WATCH_PROCS) {
+        while (*tok == ' ')
+            tok++;
+        char *end = tok + strlen(tok) - 1;
+        while (end > tok && *end == ' ')
+            *end-- = '\0';
+        if (*tok) {
+            proc_watch_t *pw = &state.watch_procs[state.watch_proc_count];
+            size_t nlen = strlen(tok);
+            if (nlen >= sizeof(pw->name))
+                nlen = sizeof(pw->name) - 1;
+            memcpy(pw->name, tok, nlen);
+            pw->name[nlen] = '\0';
+            pw->was_running = false;
+            state.watch_proc_count++;
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool is_process_running(const char *name, int *pid_out, unsigned long *rss_kb_out) {
+    *pid_out = 0;
+    *rss_kb_out = 0;
+    DIR *d = opendir("/proc");
+    if (!d)
+        return false;
+    struct dirent *ent;
+    bool found = false;
+    while ((ent = readdir(d)) != NULL) {
+        if (!isdigit((unsigned char)ent->d_name[0]))
+            continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
+        char comm[PROC_NAME_MAX];
+        if (!read_file_line(path, comm, sizeof(comm)))
+            continue;
+        if (strcmp(comm, name) == 0) {
+            *pid_out = atoi(ent->d_name);
+            // read RSS from /proc/PID/statm (second field, in pages)
+            snprintf(path, sizeof(path), "/proc/%s/statm", ent->d_name);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                unsigned long size_pages, rss_pages;
+                if (fscanf(f, "%lu %lu", &size_pages, &rss_pages) == 2) {
+                    long page_size = sysconf(_SC_PAGESIZE);
+                    if (page_size > 0)
+                        *rss_kb_out = rss_pages * (unsigned long)page_size / 1024;
+                }
+                fclose(f);
+            }
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *build_processes_json(void) {
+    if (state.watch_proc_count == 0)
+        return NULL;
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < state.watch_proc_count; i++) {
+        cJSON *pobj = cJSON_CreateObject();
+        cJSON_AddStringToObject(pobj, "name", state.watch_procs[i].name);
+        int pid;
+        unsigned long rss_kb;
+        bool running_now = is_process_running(state.watch_procs[i].name, &pid, &rss_kb);
+        cJSON_AddBoolToObject(pobj, "running", running_now);
+        if (running_now) {
+            cJSON_AddNumberToObject(pobj, "pid", pid);
+            cJSON_AddNumberToObject(pobj, "rss_kb", (double)rss_kb);
+            // uptime of the process
+            char path[PATH_MAX], buf[64];
+            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                // field 22 is starttime in clock ticks
+                char stat_buf[1024];
+                if (fgets(stat_buf, (int)sizeof(stat_buf), f)) {
+                    // skip past the comm field (which may contain spaces/parens)
+                    char *close_paren = strrchr(stat_buf, ')');
+                    if (close_paren) {
+                        unsigned long long starttime = 0;
+                        // fields after ')' are: state, ppid, pgrp, session, tty_nr, tpgid,
+                        //   flags, minflt, cminflt, majflt, cmajflt, utime, stime, cutime,
+                        //   cstime, priority, nice, num_threads, itrealvalue, starttime
+                        int n = sscanf(close_paren + 2,
+                                       "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u "
+                                       "%*u %*d %*d %*d %*d %*d %*d %llu",
+                                       &starttime);
+                        if (n == 1) {
+                            long hz = sysconf(_SC_CLK_TCK);
+                            if (hz > 0) {
+                                struct sysinfo si;
+                                if (sysinfo(&si) == 0) {
+                                    long proc_uptime = si.uptime - (long)(starttime / (unsigned long long)hz);
+                                    if (proc_uptime >= 0)
+                                        cJSON_AddNumberToObject(pobj, "uptime_secs", (double)proc_uptime);
+                                }
+                            }
+                        }
+                    }
+                }
+                fclose(f);
+            }
+            // cpu time (utime + stime)
+            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+            f = fopen(path, "r");
+            if (f) {
+                char stat_buf2[1024];
+                if (fgets(stat_buf2, (int)sizeof(stat_buf2), f)) {
+                    char *cp = strrchr(stat_buf2, ')');
+                    if (cp) {
+                        unsigned long utime = 0, stime = 0;
+                        sscanf(cp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &utime, &stime);
+                        long hz = sysconf(_SC_CLK_TCK);
+                        if (hz > 0)
+                            cJSON_AddNumberToObject(pobj, "cpu_secs", (double)(utime + stime) / (double)hz);
+                    }
+                }
+                fclose(f);
+            }
+            (void)buf; // unused in this branch
+        }
+        cJSON_AddItemToArray(arr, pobj);
+    }
+    return arr;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool check_process_state_changes(void) {
+    bool changed = false;
+    for (int i = 0; i < state.watch_proc_count; i++) {
+        int pid;
+        unsigned long rss_kb;
+        bool running_now = is_process_running(state.watch_procs[i].name, &pid, &rss_kb);
+        if (running_now != state.watch_procs[i].was_running) {
+            printf("hostmon: process '%s' %s -> %s\n", state.watch_procs[i].name, state.watch_procs[i].was_running ? "running" : "stopped", running_now ? "running" : "stopped");
+            state.watch_procs[i].was_running = running_now;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool get_default_gateway(char *gw_buf, size_t gw_size) {
+    gw_buf[0] = '\0';
+    FILE *f = fopen("/proc/net/route", "r");
+    if (!f)
+        return false;
+    char line[256];
+    // skip header
+    if (!fgets(line, (int)sizeof(line), f)) {
+        fclose(f);
+        return false;
+    }
+    while (fgets(line, (int)sizeof(line), f)) {
+        char iface[32];
+        unsigned long dest, gateway;
+        if (sscanf(line, "%31s %lx %lx", iface, &dest, &gateway) == 3) {
+            if (dest == 0 && gateway != 0) {
+                struct in_addr addr;
+                addr.s_addr = (in_addr_t)gateway;
+                inet_ntop(AF_INET, &addr, gw_buf, (socklen_t)gw_size);
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return gw_buf[0] != '\0';
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool ping_host(const char *host) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s >/dev/null 2>&1", host);
+    return system(cmd) == 0;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool check_dns_resolution(const char *hostname, char *result_ip, size_t result_size) {
+    result_ip[0] = '\0';
+    if (!hostname || !*hostname)
+        return false;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(hostname, NULL, &hints, &res);
+    if (rc != 0)
+        return false;
+    if (res && res->ai_addr) {
+        struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+        inet_ntop(AF_INET, &sa->sin_addr, result_ip, (socklen_t)result_size);
+    }
+    freeaddrinfo(res);
+    return result_ip[0] != '\0';
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool is_filesystem_readonly(const char *mountpoint) {
+    struct statvfs st;
+    if (statvfs(mountpoint, &st) != 0)
+        return false;
+    return (st.f_flag & ST_RDONLY) != 0;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *build_usb_json(void) {
+    cJSON *arr = cJSON_CreateArray();
+    DIR *d = opendir("/sys/bus/usb/devices");
+    if (!d)
+        return arr;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.')
+            continue;
+        // skip interface entries (contain ':')
+        if (strchr(ent->d_name, ':') != NULL)
+            continue;
+        // skip root hubs (usb1, usb2, etc.)
+        if (strncmp(ent->d_name, "usb", 3) == 0)
+            continue;
+        char path[PATH_MAX], buf[128];
+
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", ent->d_name);
+        if (!read_file_line(path, buf, sizeof(buf)))
+            continue;
+
+        cJSON *dev = cJSON_CreateObject();
+        cJSON_AddStringToObject(dev, "bus_id", ent->d_name);
+        cJSON_AddStringToObject(dev, "vendor_id", buf);
+
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idProduct", ent->d_name);
+        if (read_file_line(path, buf, sizeof(buf)))
+            cJSON_AddStringToObject(dev, "product_id", buf);
+
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/manufacturer", ent->d_name);
+        if (read_file_line(path, buf, sizeof(buf)))
+            cJSON_AddStringToObject(dev, "manufacturer", buf);
+
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name);
+        if (read_file_line(path, buf, sizeof(buf)))
+            cJSON_AddStringToObject(dev, "product", buf);
+
+        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/serial", ent->d_name);
+        if (read_file_line(path, buf, sizeof(buf)))
+            cJSON_AddStringToObject(dev, "serial", buf);
+
+        cJSON_AddItemToArray(arr, dev);
+    }
+    closedir(d);
+    return arr;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -426,7 +796,8 @@ static cJSON *build_platform_json(void) {
                 size_t len = strlen(val);
                 while (len > 0 && (val[len - 1] == '\n' || val[len - 1] == '"'))
                     val[--len] = '\0';
-                if (*val == '"') val++;
+                if (*val == '"')
+                    val++;
                 cJSON_AddStringToObject(root, "os_pretty", val);
                 break;
             }
@@ -518,6 +889,8 @@ static cJSON *build_interface_json(const iface_state_t *iface) {
     return obj;
 }
 
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static cJSON *build_system_json(void) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "timestamp", get_timestamp_iso8601());
@@ -579,7 +952,45 @@ static cJSON *build_system_json(void) {
         cJSON_AddNumberToObject(disk, "avail_mb", (double)disk_avail);
         if (disk_total > 0)
             cJSON_AddNumberToObject(disk, "used_pct", 100.0 * (double)disk_used / (double)disk_total);
+        cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
     }
+
+    // NTP sync
+    cJSON *ntp = build_ntp_json();
+    if (ntp)
+        cJSON_AddItemToObject(root, "ntp", ntp);
+
+    // process watchdog
+    cJSON *procs = build_processes_json();
+    if (procs)
+        cJSON_AddItemToObject(root, "processes", procs);
+
+    // default gateway reachability
+    cJSON *gw = cJSON_AddObjectToObject(root, "gateway");
+    char gw_ip[INET_ADDRSTRLEN];
+    if (get_default_gateway(gw_ip, sizeof(gw_ip))) {
+        cJSON_AddStringToObject(gw, "ip", gw_ip);
+        cJSON_AddBoolToObject(gw, "reachable", ping_host(gw_ip));
+    } else {
+        cJSON_AddStringToObject(gw, "ip", "none");
+        cJSON_AddBoolToObject(gw, "reachable", false);
+    }
+
+    // DNS resolution check
+    if (state.dns_check_host && *state.dns_check_host) {
+        cJSON *dns = cJSON_AddObjectToObject(root, "dns");
+        cJSON_AddStringToObject(dns, "check_host", state.dns_check_host);
+        char resolved_ip[INET_ADDRSTRLEN];
+        bool resolved = check_dns_resolution(state.dns_check_host, resolved_ip, sizeof(resolved_ip));
+        cJSON_AddBoolToObject(dns, "ok", resolved);
+        if (resolved)
+            cJSON_AddStringToObject(dns, "resolved_ip", resolved_ip);
+    }
+
+    // USB devices
+    cJSON *usb = build_usb_json();
+    if (usb)
+        cJSON_AddItemToObject(root, "usb", usb);
 
     return root;
 }
@@ -656,12 +1067,21 @@ static time_t intervalable(const time_t interval, time_t *last) {
 
 static void hostmon_run(void) {
 
-    printf("hostmon: running (platform=%lds, system=%lds, interfaces=%d, topic=%s)\n", (long)state.interval_platform, (long)state.interval_system, state.interface_count, state.mqtt_topic_prefix);
+    printf("hostmon: running (platform=%lds, system=%lds, interfaces=%d, "
+           "procs=%d, dns=%s, topic=%s)\n",
+           (long)state.interval_platform, (long)state.interval_system, state.interface_count, state.watch_proc_count, state.dns_check_host ? state.dns_check_host : "none", state.mqtt_topic_prefix);
 
     for (int i = 0; i < state.interface_count; i++) {
         iface_state_t *iface = &state.interfaces[i];
         iface->was_up = get_iface_operstate(iface->name);
         get_iface_ip(iface->name, iface->prev_ip, sizeof(iface->prev_ip));
+    }
+
+    for (int i = 0; i < state.watch_proc_count; i++) {
+        int pid;
+        unsigned long rss_kb;
+        state.watch_procs[i].was_running = is_process_running(state.watch_procs[i].name, &pid, &rss_kb);
+        printf("hostmon: watching process '%s' (%s)\n", state.watch_procs[i].name, state.watch_procs[i].was_running ? "running" : "not found");
     }
 
     publish_json("platform", build_platform_json());
@@ -679,15 +1099,23 @@ static void hostmon_run(void) {
         if (!running)
             break;
 
+        bool urgent = false;
+
         if (check_network_state_changes()) {
             printf("hostmon: network state change, publishing immediately\n");
+            urgent = true;
+        }
+        if (check_process_state_changes()) {
+            printf("hostmon: process state change, publishing immediately\n");
+            urgent = true;
+        }
+        if (urgent) {
             publish_json("system", build_system_json());
             state.interval_system_last = time(NULL);
         }
 
         if (intervalable(state.interval_platform, &state.interval_platform_last))
             publish_json("platform", build_platform_json());
-
         if (intervalable(state.interval_system, &state.interval_system_last))
             publish_json("system", build_system_json());
     }
@@ -722,6 +1150,11 @@ static bool config_setup(const int argc, char *argv[]) {
     state.interval_platform = (time_t)config_get_integer("interval-platform", INTERVAL_PLATFORM_DEFAULT);
     state.interval_system = (time_t)config_get_integer("interval-system", INTERVAL_SYSTEM_DEFAULT);
     state.debug = config_get_bool("debug", false);
+    state.dns_check_host = config_get_string("dns-check-host", NULL);
+
+    const char *watch_csv = config_get_string("watch-processes", NULL);
+    if (watch_csv)
+        parse_watch_processes(watch_csv);
 
     mqtt_config_populate(&state.mqtt_config);
 
