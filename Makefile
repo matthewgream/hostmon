@@ -27,7 +27,7 @@ CFLAGS_COMMON=\
 CFLAGS_OPT=-O3
 CFLAGS=$(CFLAGS_COMMON) $(CFLAGS_OPT)
 LDFLAGS=
-LIBS=-lcjson -lmosquitto
+LIBS=-lcjson -lmosquitto -lm
 
 ##
 

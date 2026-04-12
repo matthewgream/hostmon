@@ -41,6 +41,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <math.h>
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -386,17 +387,10 @@ static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t
     int found = 0;
     *total_kb = *available_kb = *free_kb = 0;
     while (fgets(line, (int)sizeof(line), f) && found < 3) {
-        uint64_t val;
-        if (sscanf(line, "MemTotal: %lu", (unsigned long *)&val) == 1) {
-            *total_kb = val;
-            found++;
-        } else if (sscanf(line, "MemAvailable: %lu", (unsigned long *)&val) == 1) {
-            *available_kb = val;
-            found++;
-        } else if (sscanf(line, "MemFree: %lu", (unsigned long *)&val) == 1) {
-            *free_kb = val;
-            found++;
-        }
+        unsigned long val;
+        if (sscanf(line, "MemTotal: %lu", &val) == 1) { *total_kb = (uint64_t)val; found++; }
+        else if (sscanf(line, "MemAvailable: %lu", &val) == 1) { *available_kb = (uint64_t)val; found++; }
+        else if (sscanf(line, "MemFree: %lu", &val) == 1) { *free_kb = (uint64_t)val; found++; }
     }
     fclose(f);
     return found >= 2;
@@ -881,8 +875,8 @@ static cJSON *build_system_json(void) {
     // cpu temp
     double temp;
     if (get_cpu_temp(&temp))
-        cJSON_AddNumberToObject(root, "cpu_temp_c", temp);
-
+        cJSON_AddNumberToObject(root, "cpu_temp_c", round(temp * 10.0) / 10.0);
+                
     // load
     double l1, l5, l15;
     if (get_load_averages(&l1, &l5, &l15)) {
@@ -900,7 +894,7 @@ static cJSON *build_system_json(void) {
         cJSON_AddNumberToObject(mem, "available_kb", (double)mem_avail);
         cJSON_AddNumberToObject(mem, "free_kb", (double)mem_free);
         if (mem_total > 0)
-            cJSON_AddNumberToObject(mem, "used_pct", 100.0 * (double)(mem_total - mem_avail) / (double)mem_total);
+            cJSON_AddNumberToObject(mem, "used_pct", round(1000.0 * (double)(mem_total - mem_avail) / (double)mem_total) / 10.0);
     }
 
     // network interfaces
@@ -921,7 +915,7 @@ static cJSON *build_system_json(void) {
         cJSON_AddNumberToObject(disk, "used_mb", (double)disk_used);
         cJSON_AddNumberToObject(disk, "avail_mb", (double)disk_avail);
         if (disk_total > 0)
-            cJSON_AddNumberToObject(disk, "used_pct", 100.0 * (double)disk_used / (double)disk_total);
+            cJSON_AddNumberToObject(disk, "used_pct", round(1000.0 * (double)disk_used / (double)disk_total) / 10.0);
         cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
     }
 
