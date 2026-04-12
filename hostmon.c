@@ -1013,7 +1013,7 @@ static cJSON *build_platform_json(void) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static bool publish_json(const char *subtopic, cJSON *json) {
-    if (!json)
+    if (!json || !mqtt_is_connected())
         return false;
     char *str = cJSON_PrintUnformatted(json);
     if (!str) {
