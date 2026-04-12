@@ -12,9 +12,9 @@
  * retained messages for immediate delivery to new subscribers.
  *
  * Two publication intervals:
- *   - "host" (slow): static/rarely changing info — hostname, OS version,
+ *   - "platform" (slow): static/rarely changing info — hostname, OS version,
  *     kernel, architecture, boot time. Default 24 hours.
- *   - "platform" (fast): dynamic info — network interface states, IPs,
+ *   - "system" (fast): dynamic info — network interface states, IPs,
  *     TX/RX counters, WiFi signal, CPU temp, memory, load. Default 60s.
  *
  * Network state changes (link up/down, IP change) trigger immediate
@@ -219,29 +219,30 @@ static char *get_timestamp_iso8601(void) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static void discover_interfaces(void) {
+static int discover_interfaces(void) {
     state.interface_count = 0;
     DIR *d = opendir("/sys/class/net");
-    if (!d)
-        return;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && state.interface_count < MAX_INTERFACES) {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-            continue;
-        if (strcmp(ent->d_name, "lo") == 0)
-            continue;
-        iface_state_t *iface = &state.interfaces[state.interface_count];
-        string_memcpy(iface->name, sizeof(iface->name), ent->d_name);
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", ent->d_name);
-        iface->is_wifi = (access(path, F_OK) == 0);
-        iface->was_up = false;
-        iface->prev_ip[0] = '\0';
-        state.interface_count++;
-        if (state.debug)
-            printf("hostmon: discovered interface %s (%s)\n", iface->name, iface->is_wifi ? "wifi" : "ethernet");
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && state.interface_count < MAX_INTERFACES) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            if (strcmp(ent->d_name, "lo") == 0)
+                continue;
+            iface_state_t *iface = &state.interfaces[state.interface_count];
+            string_memcpy(iface->name, sizeof(iface->name), ent->d_name);
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", ent->d_name);
+            iface->is_wifi = (access(path, F_OK) == 0);
+            iface->was_up = false;
+            iface->prev_ip[0] = '\0';
+            state.interface_count++;
+            if (state.debug)
+                printf("hostmon: discovered interface %s (%s)\n", iface->name, iface->is_wifi ? "wifi" : "ethernet");
+        }
+        closedir(d);
     }
-    closedir(d);
+    return state.interface_count;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -615,7 +616,7 @@ static cJSON *build_processes_json(void) {
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool processesess_state_changes(void) {
+static bool processes_check_state_changes(void) {
     bool changed = false;
     for (int i = 0; i < state.processes_count; i++) {
         int pid;
@@ -628,6 +629,17 @@ static bool processesess_state_changes(void) {
         }
     }
     return changed;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+void processes_init(void) {
+    for (int i = 0; i < state.processes_count; i++) {
+        int pid;
+        unsigned long rss_kb;
+        state.processes[i].was_running = is_process_running(state.processes[i].name, &pid, &rss_kb);
+        printf("hostmon: watching process '%s' (%s)\n", state.processes[i].name, state.processes[i].was_running ? "running" : "not found");
+    }
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -701,47 +713,40 @@ static bool is_filesystem_readonly(const char *mountpoint) {
 static cJSON *build_usb_json(void) {
     cJSON *arr = cJSON_CreateArray();
     DIR *d = opendir("/sys/bus/usb/devices");
-    if (!d)
-        return arr;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.')
-            continue;
-        // skip interface entries (contain ':')
-        if (strchr(ent->d_name, ':') != NULL)
-            continue;
-        // skip root hubs (usb1, usb2, etc.)
-        if (strncmp(ent->d_name, "usb", 3) == 0)
-            continue;
-        char path[PATH_MAX], buf[128];
-
-        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", ent->d_name);
-        if (!read_file_line(path, buf, sizeof(buf)))
-            continue;
-
-        cJSON *dev = cJSON_CreateObject();
-        cJSON_AddStringToObject(dev, "bus_id", ent->d_name);
-        cJSON_AddStringToObject(dev, "vendor_id", buf);
-
-        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idProduct", ent->d_name);
-        if (read_file_line(path, buf, sizeof(buf)))
-            cJSON_AddStringToObject(dev, "product_id", buf);
-
-        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/manufacturer", ent->d_name);
-        if (read_file_line(path, buf, sizeof(buf)))
-            cJSON_AddStringToObject(dev, "manufacturer", buf);
-
-        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name);
-        if (read_file_line(path, buf, sizeof(buf)))
-            cJSON_AddStringToObject(dev, "product", buf);
-
-        snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/serial", ent->d_name);
-        if (read_file_line(path, buf, sizeof(buf)))
-            cJSON_AddStringToObject(dev, "serial", buf);
-
-        cJSON_AddItemToArray(arr, dev);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.')
+                continue;
+            // skip interface entries (contain ':')
+            if (strchr(ent->d_name, ':') != NULL)
+                continue;
+            // skip root hubs (usb1, usb2, etc.)
+            if (strncmp(ent->d_name, "usb", 3) == 0)
+                continue;
+            char path[PATH_MAX], buf[128];
+            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", ent->d_name);
+            if (!read_file_line(path, buf, sizeof(buf)))
+                continue;
+            cJSON *dev = cJSON_CreateObject();
+            cJSON_AddStringToObject(dev, "bus_id", ent->d_name);
+            cJSON_AddStringToObject(dev, "vendor_id", buf);
+            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idProduct", ent->d_name);
+            if (read_file_line(path, buf, sizeof(buf)))
+                cJSON_AddStringToObject(dev, "product_id", buf);
+            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/manufacturer", ent->d_name);
+            if (read_file_line(path, buf, sizeof(buf)))
+                cJSON_AddStringToObject(dev, "manufacturer", buf);
+            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name);
+            if (read_file_line(path, buf, sizeof(buf)))
+                cJSON_AddStringToObject(dev, "product", buf);
+            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/serial", ent->d_name);
+            if (read_file_line(path, buf, sizeof(buf)))
+                cJSON_AddStringToObject(dev, "serial", buf);
+            cJSON_AddItemToArray(arr, dev);
+        }
+        closedir(d);
     }
-    closedir(d);
     return arr;
 }
 
@@ -874,7 +879,7 @@ static cJSON *build_system_json(void) {
     cJSON_AddStringToObject(root, "timestamp", get_timestamp_iso8601());
     cJSON_AddStringToObject(root, "type", "system");
 
-    // uptime
+    // show uptime
     struct sysinfo si;
     if (sysinfo(&si) == 0) {
         cJSON_AddNumberToObject(root, "uptime_secs", (double)si.uptime);
@@ -883,12 +888,12 @@ static cJSON *build_system_json(void) {
         cJSON_AddStringToObject(root, "uptime", upstr);
     }
 
-    // cpu temp
+    // show temp
     double temp;
     if (get_cpu_temp(&temp))
         cJSON_AddNumberToObject(root, "cpu_temp_c", round(temp * 10.0) / 10.0);
 
-    // load
+    // show load
     double l1, l5, l15;
     if (get_load_averages(&l1, &l5, &l15)) {
         cJSON *load = cJSON_AddObjectToObject(root, "load");
@@ -897,7 +902,7 @@ static cJSON *build_system_json(void) {
         cJSON_AddNumberToObject(load, "15min", l15);
     }
 
-    // memory
+    // show memory
     uint64_t mem_total, mem_avail, mem_free;
     if (get_memory_info(&mem_total, &mem_avail, &mem_free)) {
         cJSON *mem = cJSON_AddObjectToObject(root, "memory");
@@ -908,17 +913,17 @@ static cJSON *build_system_json(void) {
             cJSON_AddNumberToObject(mem, "used_pct", round(1000.0 * (double)(mem_total - mem_avail) / (double)mem_total) / 10.0);
     }
 
-    // network interfaces
+    // show network interfaces
     cJSON *ifaces = cJSON_AddArrayToObject(root, "network");
     for (int i = 0; i < state.interface_count; i++)
         cJSON_AddItemToArray(ifaces, build_interface_json(&state.interfaces[i]));
 
-    // mqtt connection status
+    // show mqtt connection status
     cJSON *mq = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddBoolToObject(mq, "connected", mqtt_is_connected());
     cJSON_AddNumberToObject(mq, "disconnects", (double)mqtt_stat_disconnects);
 
-    // disk usage (root filesystem)
+    // show disk usage (root filesystem)
     uint64_t disk_total, disk_used, disk_avail;
     if (get_disk_usage("/", &disk_total, &disk_used, &disk_avail)) {
         cJSON *disk = cJSON_AddObjectToObject(root, "disk");
@@ -930,7 +935,7 @@ static cJSON *build_system_json(void) {
         cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
     }
 
-    // USB devices
+    // show USB devices
     cJSON *usb = build_usb_json();
     if (usb)
         cJSON_AddItemToObject(root, "usb", usb);
@@ -1003,7 +1008,7 @@ static bool publish_json(const char *subtopic, cJSON *json) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool check_network_state_changes(void) {
+static bool interfaces_check_state_changes(void) {
     bool changed = false;
     for (int i = 0; i < state.interface_count; i++) {
         iface_state_t *iface = &state.interfaces[i];
@@ -1027,18 +1032,28 @@ static bool check_network_state_changes(void) {
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
+
+void interfaces_init(void) {
+    for (int i = 0; i < state.interface_count; i++) {
+        iface_state_t *iface = &state.interfaces[i];
+        iface->was_up = get_iface_operstate(iface->name);
+        get_iface_ip(iface->name, iface->prev_ip, sizeof(iface->prev_ip));
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static time_t intervalable(const time_t interval, time_t *last) {
+static time_t intervalable(const time_t interval, time_t *last, bool forced) {
     time_t now = time(NULL);
     if (*last == 0) {
         *last = now;
         return 0;
     }
-    if ((now - *last) > interval) {
+    if ((now - *last) > interval || forced) {
         const time_t diff = now - *last;
         *last = now;
-        return diff;
+        return diff ? diff : (forced ? 1 : 0);
     }
     return 0;
 }
@@ -1050,18 +1065,8 @@ static void hostmon_run(void) {
     printf("hostmon: running (platform=%lds, system=%lds, interfaces=%d, procs=%d, dns=%s, topic=%s)\n", (long)state.interval_platform, (long)state.interval_system, state.interface_count, state.processes_count,
            state.check_dns ? state.check_dns : "none", state.mqtt_topic_prefix);
 
-    for (int i = 0; i < state.interface_count; i++) {
-        iface_state_t *iface = &state.interfaces[i];
-        iface->was_up = get_iface_operstate(iface->name);
-        get_iface_ip(iface->name, iface->prev_ip, sizeof(iface->prev_ip));
-    }
-
-    for (int i = 0; i < state.processes_count; i++) {
-        int pid;
-        unsigned long rss_kb;
-        state.processes[i].was_running = is_process_running(state.processes[i].name, &pid, &rss_kb);
-        printf("hostmon: watching process '%s' (%s)\n", state.processes[i].name, state.processes[i].was_running ? "running" : "not found");
-    }
+    processes_init();
+    interfaces_init();
 
     publish_json("platform", build_platform_json());
     state.interval_platform_last = time(NULL);
@@ -1070,32 +1075,26 @@ static void hostmon_run(void) {
 
     while (running) {
 
+        bool forced = false;
+        if (interfaces_check_state_changes()) {
+            printf("hostmon: network state change, publishing immediately\n");
+            forced = true;
+        }
+        if (processes_check_state_changes()) {
+            printf("hostmon: process state change, publishing immediately\n");
+            forced = true;
+        }
+
+        if (intervalable(state.interval_platform, &state.interval_platform_last, false))
+            publish_json("platform", build_platform_json());
+
+        if (intervalable(state.interval_system, &state.interval_system_last, forced))
+            publish_json("system", build_system_json());
+
         if (state.mqtt_config.use_synchronous)
             mqtt_loop(1000);
         else
             usleep(1000000); /* 1 second */
-
-        if (!running)
-            break;
-
-        bool urgent = false;
-        if (check_network_state_changes()) {
-            printf("hostmon: network state change, publishing immediately\n");
-            urgent = true;
-        }
-        if (processesess_state_changes()) {
-            printf("hostmon: process state change, publishing immediately\n");
-            urgent = true;
-        }
-        if (urgent) {
-            publish_json("system", build_system_json());
-            state.interval_system_last = time(NULL);
-        }
-
-        if (intervalable(state.interval_platform, &state.interval_platform_last))
-            publish_json("platform", build_platform_json());
-        if (intervalable(state.interval_system, &state.interval_system_last))
-            publish_json("system", build_system_json());
     }
 }
 
@@ -1152,29 +1151,25 @@ static void signal_handler(const int sig __attribute__((unused))) {
 
 int main(int argc, char *argv[]) {
 
-    int ret = EXIT_FAILURE;
-
     setbuf(stdout, NULL);
     printf("starting (hostmon: host system monitor)\n");
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
     if (!config_setup(argc, argv))
-        goto end_all;
+        return EXIT_FAILURE;
 
-    discover_interfaces();
-    if (state.interface_count == 0)
+    if (!discover_interfaces())
         printf("hostmon: WARNING no network interfaces discovered\n");
 
     if (!mqtt_begin(&state.mqtt_config))
-        goto end_all;
+        return EXIT_FAILURE;
 
     hostmon_run();
-    ret = EXIT_SUCCESS;
 
     mqtt_end();
-end_all:
-    return ret;
+
+    return EXIT_SUCCESS;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
