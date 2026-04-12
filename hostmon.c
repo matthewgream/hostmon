@@ -128,21 +128,21 @@ const config_option_help_t config_options_help[] = {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-#define MAX_INTERFACES 8
-#define MAX_PROCESSES  16
-#define IFACE_NAME_MAX 32
-#define PROC_NAME_MAX  64
-#define TOPIC_MAX      255
+#define MAX_INTERFACES     8
+#define MAX_PROCESSES      16
+#define INTERFACE_NAME_MAX 32
+#define PROCESS_NAME_MAX   64
+#define TOPIC_MAX          255
 
 typedef struct {
-    char name[IFACE_NAME_MAX];
+    char name[INTERFACE_NAME_MAX];
     bool is_wifi;
     bool was_up;
     char prev_ip[INET_ADDRSTRLEN];
 } iface_state_t;
 
 typedef struct {
-    char name[PROC_NAME_MAX];
+    char name[PROCESS_NAME_MAX];
     bool was_running;
 } proc_watch_t;
 
@@ -315,7 +315,7 @@ static bool get_wifi_signal(const char *name, int *signal_dbm) {
     }
     bool found = false;
     while (fgets(line, (int)sizeof(line), f)) {
-        char iface[IFACE_NAME_MAX];
+        char iface[INTERFACE_NAME_MAX];
         int status;
         float link, level;
         if (sscanf(line, " %31[^:]: %d %f %f", iface, &status, &link, &level) >= 4)
@@ -533,7 +533,7 @@ static bool is_process_running(const char *name, int *pid_out, unsigned long *rs
             continue;
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
-        char comm[PROC_NAME_MAX];
+        char comm[PROCESS_NAME_MAX];
         if (!read_file_line(path, comm, sizeof(comm)))
             continue;
         if (strcmp(comm, name) == 0) {
