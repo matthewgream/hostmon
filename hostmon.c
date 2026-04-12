@@ -61,9 +61,6 @@ volatile bool running = true;
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-typedef int serial_bits_t;
-#define SERIAL_8N1           0
-
 #define MQTT_CONNECT_TIMEOUT 60
 #define MQTT_PUBLISH_QOS     0
 #define MQTT_PUBLISH_RETAIN  true
@@ -85,6 +82,8 @@ typedef int serial_bits_t;
 #define INTERVAL_PLATFORM_DEFAULT        (24 * 60 * 60)
 #define INTERVAL_SYSTEM_DEFAULT          60
 
+typedef int serial_bits_t;
+#define SERIAL_8N1 0
 #include "config_linux.h"
 
 // clang-format off
@@ -100,7 +99,9 @@ const struct option config_options[] = {
     {"interval-platform",           required_argument, 0, 0},
     {"interval-system",             required_argument, 0, 0},
     {"check-processes",             required_argument, 0, 0},
-    {"check-dns-host",              required_argument, 0, 0},
+    {"check-timesync",              required_argument, 0, 0},
+    {"check-gateway",               required_argument, 0, 0},
+    {"check-dns",                   required_argument, 0, 0},
     {"debug",                       required_argument, 0, 0},
     {0, 0, 0, 0}
 };
@@ -116,8 +117,10 @@ const config_option_help_t config_options_help[] = {
     {"mqtt-reconnect-delay-max","MQTT max reconnect delay in seconds"},
     {"interval-platform",       "Platform info publish interval in seconds (default: 86400)"},
     {"interval-system",         "System info publish interval in seconds (default: 60)"},
-    {"check-processes",         "Comma-separated list of process names to monitor and check"},
-    {"check-dns-host",          "Hostname to resolve for DNS health check"},
+    {"check-processes",         "Check list of processes (comma-separated) (default: unspecified)"},
+    {"check-timesync",          "Check time synchronisation (default: true)"},
+    {"check-gateway",           "Check ping to network gateway (default: true)"},
+    {"check-dns",               "Check resolution of specified DNS host (default: unspecified)"},
     {"debug",                   "Enable debug output (true/false)"},
 };
 // clang-format on
@@ -154,8 +157,10 @@ typedef struct {
     iface_state_t interfaces[MAX_INTERFACES];
     int interface_count;
     proc_watch_t processes[MAX_PROCESSES];
-    int process_count;
-    const char *check_dns_host;
+    int processes_count;
+    bool check_timesync;
+    bool check_gateway;
+    const char *check_dns;
 } hostmon_state_t;
 
 static hostmon_state_t state;
@@ -388,9 +393,16 @@ static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t
     *total_kb = *available_kb = *free_kb = 0;
     while (fgets(line, (int)sizeof(line), f) && found < 3) {
         unsigned long val;
-        if (sscanf(line, "MemTotal: %lu", &val) == 1) { *total_kb = (uint64_t)val; found++; }
-        else if (sscanf(line, "MemAvailable: %lu", &val) == 1) { *available_kb = (uint64_t)val; found++; }
-        else if (sscanf(line, "MemFree: %lu", &val) == 1) { *free_kb = (uint64_t)val; found++; }
+        if (sscanf(line, "MemTotal: %lu", &val) == 1) {
+            *total_kb = (uint64_t)val;
+            found++;
+        } else if (sscanf(line, "MemAvailable: %lu", &val) == 1) {
+            *available_kb = (uint64_t)val;
+            found++;
+        } else if (sscanf(line, "MemFree: %lu", &val) == 1) {
+            *free_kb = (uint64_t)val;
+            found++;
+        }
     }
     fclose(f);
     return found >= 2;
@@ -418,15 +430,15 @@ static bool get_disk_usage(const char *path, uint64_t *total_mb, uint64_t *used_
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static cJSON *build_ntp_json(void) {
-    cJSON *ntp = cJSON_CreateObject();
+static cJSON *build_timesync_json(void) {
+    cJSON *timesync = cJSON_CreateObject();
 
     // try timedatectl (systemd-timesyncd)
     FILE *f = popen("timedatectl show --property=NTPSynchronized --value 2>/dev/null", "r");
     if (f) {
         char buf[32];
         if (fgets(buf, (int)sizeof(buf), f))
-            cJSON_AddBoolToObject(ntp, "synchronized", strcmp(string_cleanup(buf), "yes") == 0);
+            cJSON_AddBoolToObject(timesync, "synchronized", strcmp(string_cleanup(buf), "yes") == 0);
         pclose(f);
     }
 
@@ -442,7 +454,7 @@ static cJSON *build_ntp_json(void) {
                     char *end = strchr(paren + 1, ')');
                     if (end) {
                         *end = '\0';
-                        cJSON_AddStringToObject(ntp, "source", paren + 1);
+                        cJSON_AddStringToObject(timesync, "source", paren + 1);
                         found_source = true;
                     }
                 }
@@ -451,18 +463,18 @@ static cJSON *build_ntp_json(void) {
             if (strncmp(line, "Last offset", 11) == 0) {
                 const char *colon = strchr(line, ':');
                 if (colon && sscanf(colon + 1, " %lf", &offset_val) == 1)
-                    cJSON_AddNumberToObject(ntp, "offset_secs", offset_val);
+                    cJSON_AddNumberToObject(timesync, "offset_secs", offset_val);
             }
             if (strncmp(line, "Stratum", 7) == 0) {
                 const char *colon = strchr(line, ':');
                 if (colon)
-                    cJSON_AddNumberToObject(ntp, "stratum", atoi(colon + 1));
+                    cJSON_AddNumberToObject(timesync, "stratum", atoi(colon + 1));
             }
         }
         pclose(f);
     }
 
-    return ntp;
+    return timesync;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -474,17 +486,17 @@ static void parse_processes(const char *csv) {
     char buf[1024];
     string_memcpy(buf, sizeof(buf), csv);
     char *saveptr = NULL, *tok = strtok_r(buf, ",", &saveptr);
-    while (tok && state.process_count < MAX_PROCESSES) {
+    while (tok && state.processes_count < MAX_PROCESSES) {
         while (*tok == ' ')
             tok++;
         char *end = tok + strlen(tok) - 1;
         while (end > tok && *end == ' ')
             *end-- = '\0';
         if (*tok) {
-            proc_watch_t *pw = &state.processes[state.process_count];
+            proc_watch_t *pw = &state.processes[state.processes_count];
             string_memcpy(pw->name, sizeof(pw->name), tok);
             pw->was_running = false;
-            state.process_count++;
+            state.processes_count++;
         }
         tok = strtok_r(NULL, ",", &saveptr);
     }
@@ -533,10 +545,10 @@ static bool is_process_running(const char *name, int *pid_out, unsigned long *rs
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static cJSON *build_processes_json(void) {
-    if (state.process_count == 0)
+    if (state.processes_count == 0)
         return NULL;
     cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < state.process_count; i++) {
+    for (int i = 0; i < state.processes_count; i++) {
         cJSON *pobj = cJSON_CreateObject();
         cJSON_AddStringToObject(pobj, "name", state.processes[i].name);
         int pid;
@@ -605,7 +617,7 @@ static cJSON *build_processes_json(void) {
 
 static bool processesess_state_changes(void) {
     bool changed = false;
-    for (int i = 0; i < state.process_count; i++) {
+    for (int i = 0; i < state.processes_count; i++) {
         int pid;
         unsigned long rss_kb;
         const bool running_now = is_process_running(state.processes[i].name, &pid, &rss_kb);
@@ -634,14 +646,13 @@ static bool get_default_gateway(char *gw_buf, size_t gw_size) {
     while (fgets(line, (int)sizeof(line), f)) {
         char iface[32];
         unsigned long dest, gateway;
-        if (sscanf(line, "%31s %lx %lx", iface, &dest, &gateway) == 3) {
+        if (sscanf(line, "%31s %lx %lx", iface, &dest, &gateway) == 3)
             if (dest == 0 && gateway != 0) {
                 struct in_addr addr;
                 addr.s_addr = (in_addr_t)gateway;
                 inet_ntop(AF_INET, &addr, gw_buf, (socklen_t)gw_size);
                 break;
             }
-        }
     }
     fclose(f);
     return gw_buf[0] != '\0';
@@ -876,7 +887,7 @@ static cJSON *build_system_json(void) {
     double temp;
     if (get_cpu_temp(&temp))
         cJSON_AddNumberToObject(root, "cpu_temp_c", round(temp * 10.0) / 10.0);
-                
+
     // load
     double l1, l5, l15;
     if (get_load_averages(&l1, &l5, &l15)) {
@@ -919,42 +930,48 @@ static cJSON *build_system_json(void) {
         cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
     }
 
-    // NTP sync
-    cJSON *ntp = build_ntp_json();
-    if (ntp)
-        cJSON_AddItemToObject(root, "ntp", ntp);
-
-    // process watchdog
-    cJSON *procs = build_processes_json();
-    if (procs)
-        cJSON_AddItemToObject(root, "processes", procs);
-
-    // default gateway reachability
-    cJSON *gw = cJSON_AddObjectToObject(root, "gateway");
-    char gw_ip[INET_ADDRSTRLEN];
-    if (get_default_gateway(gw_ip, sizeof(gw_ip))) {
-        cJSON_AddStringToObject(gw, "ip", gw_ip);
-        cJSON_AddBoolToObject(gw, "reachable", ping_host(gw_ip));
-    } else {
-        cJSON_AddStringToObject(gw, "ip", "none");
-        cJSON_AddBoolToObject(gw, "reachable", false);
-    }
-
-    // DNS resolution check
-    if (state.check_dns_host && *state.check_dns_host) {
-        cJSON *dns = cJSON_AddObjectToObject(root, "dns");
-        cJSON_AddStringToObject(dns, "check_host", state.check_dns_host);
-        char resolved_ip[INET_ADDRSTRLEN];
-        const bool resolved = check_dns_resolution(state.check_dns_host, resolved_ip, sizeof(resolved_ip));
-        cJSON_AddBoolToObject(dns, "ok", resolved);
-        if (resolved)
-            cJSON_AddStringToObject(dns, "resolved_ip", resolved_ip);
-    }
-
     // USB devices
     cJSON *usb = build_usb_json();
     if (usb)
         cJSON_AddItemToObject(root, "usb", usb);
+
+    // check processes
+    if (state.processes_count > 0) {
+        cJSON *procs = build_processes_json();
+        if (procs)
+            cJSON_AddItemToObject(root, "processes", procs);
+    }
+
+    // check time synchronisation
+    if (state.check_timesync) {
+        cJSON *timesync = build_timesync_json();
+        if (timesync)
+            cJSON_AddItemToObject(root, "timesync", timesync);
+    }
+
+    // check gateway reachability
+    if (state.check_gateway) {
+        cJSON *gw = cJSON_AddObjectToObject(root, "gateway");
+        char gw_ip[INET_ADDRSTRLEN];
+        if (get_default_gateway(gw_ip, sizeof(gw_ip))) {
+            cJSON_AddStringToObject(gw, "ip", gw_ip);
+            cJSON_AddBoolToObject(gw, "reachable", ping_host(gw_ip));
+        } else {
+            cJSON_AddStringToObject(gw, "ip", "none");
+            cJSON_AddBoolToObject(gw, "reachable", false);
+        }
+    }
+
+    // check DNS resolution
+    if (state.check_dns && *state.check_dns) {
+        cJSON *dns = cJSON_AddObjectToObject(root, "dns");
+        cJSON_AddStringToObject(dns, "check_host", state.check_dns);
+        char resolved_ip[INET_ADDRSTRLEN];
+        const bool resolved = check_dns_resolution(state.check_dns, resolved_ip, sizeof(resolved_ip));
+        cJSON_AddBoolToObject(dns, "ok", resolved);
+        if (resolved)
+            cJSON_AddStringToObject(dns, "resolved_ip", resolved_ip);
+    }
 
     return root;
 }
@@ -975,7 +992,6 @@ static bool publish_json(const char *subtopic, cJSON *json) {
     if (gethostname(hostname, sizeof(hostname)) != 0)
         snprintf(hostname, sizeof(hostname), "unknown");
     snprintf(topic, sizeof(topic), "%s/%s/%s", state.mqtt_topic_prefix, hostname, subtopic);
-
     const bool ok = mqtt_send(topic, str, (int)strlen(str));
     if (state.debug)
         printf("hostmon: publish %s (%d bytes) -> %s\n", subtopic, (int)strlen(str), ok ? "ok" : "FAILED");
@@ -1031,8 +1047,8 @@ static time_t intervalable(const time_t interval, time_t *last) {
 
 static void hostmon_run(void) {
 
-    printf("hostmon: running (platform=%lds, system=%lds, interfaces=%d, procs=%d, dns=%s, topic=%s)\n", (long)state.interval_platform, (long)state.interval_system, state.interface_count, state.process_count,
-           state.check_dns_host ? state.check_dns_host : "none", state.mqtt_topic_prefix);
+    printf("hostmon: running (platform=%lds, system=%lds, interfaces=%d, procs=%d, dns=%s, topic=%s)\n", (long)state.interval_platform, (long)state.interval_system, state.interface_count, state.processes_count,
+           state.check_dns ? state.check_dns : "none", state.mqtt_topic_prefix);
 
     for (int i = 0; i < state.interface_count; i++) {
         iface_state_t *iface = &state.interfaces[i];
@@ -1040,7 +1056,7 @@ static void hostmon_run(void) {
         get_iface_ip(iface->name, iface->prev_ip, sizeof(iface->prev_ip));
     }
 
-    for (int i = 0; i < state.process_count; i++) {
+    for (int i = 0; i < state.processes_count; i++) {
         int pid;
         unsigned long rss_kb;
         state.processes[i].was_running = is_process_running(state.processes[i].name, &pid, &rss_kb);
@@ -1111,11 +1127,13 @@ static bool config_setup(const int argc, char *argv[]) {
     state.mqtt_topic_prefix = config_get_string("mqtt-topic-prefix", MQTT_TOPIC_PREFIX_DEFAULT);
     state.interval_platform = (time_t)config_get_integer("interval-platform", INTERVAL_PLATFORM_DEFAULT);
     state.interval_system = (time_t)config_get_integer("interval-system", INTERVAL_SYSTEM_DEFAULT);
-    state.debug = config_get_bool("debug", false);
-    state.check_dns_host = config_get_string("check-dns-host", NULL);
     const char *processes_csv = config_get_string("check-processes", NULL);
     if (processes_csv)
         parse_processes(processes_csv);
+    state.check_timesync = config_get_bool("check-timesync", true);
+    state.check_gateway = config_get_bool("check-gateway", true);
+    state.check_dns = config_get_string("check-dns", NULL);
+    state.debug = config_get_bool("debug", false);
 
     mqtt_config_populate(&state.mqtt_config);
 
