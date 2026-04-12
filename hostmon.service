@@ -1,0 +1,15 @@
+[Unit]
+Description=hostmon — host system monitor
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hostmon --config /etc/default/hostmon
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
