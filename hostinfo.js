@@ -43,12 +43,15 @@ Arguments:
   host...           Filter by hostname prefix(es)`);
         process.exit(0);
     } else if (!a.startsWith('-')) opts.hosts.push(a.toLowerCase());
-    else { console.error(`Unknown option: ${a}`); process.exit(1); }
+    else {
+        console.error(`Unknown option: ${a}`);
+        process.exit(1);
+    }
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-const data = {};      // { hostname: { platform: {}, system: {} } }
+const data = {}; // { hostname: { platform: {}, system: {} } }
 
 function onMessage(topic, payload) {
     const parts = topic.split('/');
@@ -56,17 +59,23 @@ function onMessage(topic, payload) {
     const hostname = parts[1];
     const type = parts[2];
     if (type !== 'platform' && type !== 'system') return;
-    if (opts.hosts.length > 0 && !opts.hosts.some(h => hostname.toLowerCase().startsWith(h))) return;
+    if (opts.hosts.length > 0 && !opts.hosts.some((h) => hostname.toLowerCase().startsWith(h))) return;
     try {
         if (!data[hostname]) data[hostname] = {};
         data[hostname][type] = JSON.parse(payload.toString());
-    } catch (_) { /* ignore parse errors */ }
+    } catch (_) {
+        /* ignore parse errors */
+    }
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-function stripAnsi(s) { return s.replace(/\x1b\[[0-9;]*m/g, ''); }
-function visLen(s) { return stripAnsi(String(s)).length; }
+function stripAnsi(s) {
+    return s.replace(/\x1b\[[0-9;]*m/g, '');
+}
+function visLen(s) {
+    return stripAnsi(String(s)).length;
+}
 function pad(s, n, right) {
     s = String(s ?? '');
     const vl = visLen(s);
@@ -78,11 +87,15 @@ function pad(s, n, right) {
     const fill = ' '.repeat(n - vl);
     return right ? fill + s : s + fill;
 }
-function rpad(s, n) { return pad(s, n, true); }
+function rpad(s, n) {
+    return pad(s, n, true);
+}
 
 function ago(secs) {
     if (secs == null) return '-';
-    const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+    const d = Math.floor(secs / 86400),
+        h = Math.floor((secs % 86400) / 3600),
+        m = Math.floor((secs % 3600) / 60);
     if (d > 0) return `${d}d ${h}h`;
     if (h > 0) return `${h}h ${m}m`;
     return `${m}m`;
@@ -103,9 +116,13 @@ function fmtKb(kb) {
     return kb + 'K';
 }
 
-function fmtPct(v) { return v != null ? v.toFixed(1) + '%' : '-'; }
+function fmtPct(v) {
+    return v != null ? v.toFixed(1) + '%' : '-';
+}
 
-function fmtTemp(v) { return v != null ? v.toFixed(1) + '°C' : '-'; }
+function fmtTemp(v) {
+    return v != null ? v.toFixed(1) + '°C' : '-';
+}
 
 function fmtFreq(khz) {
     if (khz == null) return '-';
@@ -121,12 +138,19 @@ function timeAge(ts) {
 
 const SEP = '─';
 const COLOURS = {
-    reset: '\x1b[0m', dim: '\x1b[2m', bold: '\x1b[1m',
-    red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m',
+    reset: '\x1b[0m',
+    dim: '\x1b[2m',
+    bold: '\x1b[1m',
+    red: '\x1b[31m',
+    green: '\x1b[32m',
+    yellow: '\x1b[33m',
+    cyan: '\x1b[36m',
 };
-const C = process.stdout.isTTY ? COLOURS : Object.fromEntries(Object.keys(COLOURS).map(k => [k, '']));
+const C = process.stdout.isTTY ? COLOURS : Object.fromEntries(Object.keys(COLOURS).map((k) => [k, '']));
 
-function indicator(ok) { return ok ? `${C.green}✓${C.reset}` : `${C.red}✗${C.reset}`; }
+function indicator(ok) {
+    return ok ? `${C.green}✓${C.reset}` : `${C.red}✗${C.reset}`;
+}
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // Platform display
@@ -134,13 +158,13 @@ function indicator(ok) { return ok ? `${C.green}✓${C.reset}` : `${C.red}✗${C
 
 function showPlatformSummary(hosts) {
     const cols = [
-        ['HOST',     22],
-        ['ARCH',      8],
-        ['KERNEL',   24],
-        ['OS',       30],
-        ['BOOT',     12],
-        ['IFACES',   20],
-        ['VERSION',   8],
+        ['HOST', 22],
+        ['ARCH', 8],
+        ['KERNEL', 24],
+        ['OS', 30],
+        ['BOOT', 12],
+        ['IFACES', 20],
+        ['VERSION', 8],
     ];
     const hdr = cols.map(([n, w]) => pad(n, w)).join('  ');
     console.log(`${C.bold}${hdr}${C.reset}`);
@@ -148,16 +172,18 @@ function showPlatformSummary(hosts) {
 
     for (const [hostname, d] of hosts) {
         const p = d.platform || {};
-        const ifaces = (p.interfaces || []).map(i => `${i.name}(${i.mac || '?'})`).join(', ');
-        console.log([
-            pad(hostname, cols[0][1]),
-            pad(p.arch, cols[1][1]),
-            pad(p.kernel, cols[2][1]),
-            pad(p.os_pretty, cols[3][1]),
-            pad(timeAge(p.boot_time), cols[4][1]),
-            pad(ifaces, cols[5][1]),
-            pad(p.hostmon_version, cols[6][1]),
-        ].join('  '));
+        const ifaces = (p.interfaces || []).map((i) => `${i.name}(${i.mac || '?'})`).join(', ');
+        console.log(
+            [
+                pad(hostname, cols[0][1]),
+                pad(p.arch, cols[1][1]),
+                pad(p.kernel, cols[2][1]),
+                pad(p.os_pretty, cols[3][1]),
+                pad(timeAge(p.boot_time), cols[4][1]),
+                pad(ifaces, cols[5][1]),
+                pad(p.hostmon_version, cols[6][1]),
+            ].join('  ')
+        );
     }
 }
 
@@ -174,8 +200,7 @@ function showPlatformDetailed(hosts) {
         console.log(`  Timestamp:    ${p.timestamp || '-'}`);
         if (p.interfaces && p.interfaces.length > 0) {
             console.log(`  Interfaces:`);
-            for (const i of p.interfaces)
-                console.log(`    ${i.name}: type=${i.type}, mac=${i.mac || '?'}`);
+            for (const i of p.interfaces) console.log(`    ${i.name}: type=${i.type}, mac=${i.mac || '?'}`);
         }
         console.log('');
     }
@@ -187,18 +212,18 @@ function showPlatformDetailed(hosts) {
 
 function showSystemSummary(hosts) {
     const cols = [
-        ['HOST',     22],
-        ['UPTIME',    8],
-        ['CPU',       7],
-        ['LOAD',      6],
-        ['MEM',      12],
-        ['SWAP',      7],
-        ['DISK',     10],
-        ['NET',      14],
-        ['MQTT',      5],
-        ['NTP',       4],
-        ['GW',        8],
-        ['DNS',       4],
+        ['HOST', 22],
+        ['UPTIME', 8],
+        ['CPU', 7],
+        ['LOAD', 6],
+        ['MEM', 12],
+        ['SWAP', 7],
+        ['DISK', 10],
+        ['NET', 14],
+        ['MQTT', 5],
+        ['NTP', 4],
+        ['GW', 8],
+        ['DNS', 4],
     ];
     const hdr = cols.map(([n, w]) => pad(n, w)).join('  ');
     console.log(`${C.bold}${hdr}${C.reset}`);
@@ -214,11 +239,13 @@ function showSystemSummary(hosts) {
         const mq = s.mqtt || {};
         const ts = s.timesync || {};
 
-        const nets = (s.network || []);
-        const netStr = nets.map(n => {
-            let st = n.up ? `${n.name}↑` : `${C.red}${n.name}↓${C.reset}`;
-            return st;
-        }).join(',');
+        const nets = s.network || [];
+        const netStr = nets
+            .map((n) => {
+                let st = n.up ? `${n.name}↑` : `${C.red}${n.name}↓${C.reset}`;
+                return st;
+            })
+            .join(',');
 
         const memStr = `${fmtPct(mem.used_pct)} ${fmtKb(mem.total_kb)}`;
         const swapStr = mem.swap_total_kb > 0 ? fmtPct(mem.swap_used_pct) : '-';
@@ -227,20 +254,22 @@ function showSystemSummary(hosts) {
         const cpuStr = cpu.throttled ? `${C.yellow}${fmtTemp(s.cpu_temp_c)}⚡${C.reset}` : fmtTemp(s.cpu_temp_c);
         const gwStr = gw.reachable != null ? (gw.reachable ? `${gw.rtt_ms != null ? gw.rtt_ms.toFixed(0) + 'ms' : 'ok'}` : `${C.red}DOWN${C.reset}`) : '-';
 
-        console.log([
-            pad(hostname, cols[0][1]),
-            pad(ago(s.uptime_secs), cols[1][1]),
-            pad(cpuStr, cols[2][1]),
-            rpad(loadStr, cols[3][1]),
-            pad(memStr, cols[4][1]),
-            rpad(swapStr, cols[5][1]),
-            pad(diskStr, cols[6][1]),
-            pad(netStr, cols[7][1]),
-            pad(indicator(mq.connected), cols[8][1]),
-            pad(indicator(ts.synchronized), cols[9][1]),
-            pad(gwStr, cols[10][1]),
-            pad(dns.ok != null ? indicator(dns.ok) : '-', cols[11][1]),
-        ].join('  '));
+        console.log(
+            [
+                pad(hostname, cols[0][1]),
+                pad(ago(s.uptime_secs), cols[1][1]),
+                pad(cpuStr, cols[2][1]),
+                rpad(loadStr, cols[3][1]),
+                pad(memStr, cols[4][1]),
+                rpad(swapStr, cols[5][1]),
+                pad(diskStr, cols[6][1]),
+                pad(netStr, cols[7][1]),
+                pad(indicator(mq.connected), cols[8][1]),
+                pad(indicator(ts.synchronized), cols[9][1]),
+                pad(gwStr, cols[10][1]),
+                pad(dns.ok != null ? indicator(dns.ok) : '-', cols[11][1]),
+            ].join('  ')
+        );
     }
 }
 
@@ -262,15 +291,14 @@ function showSystemDetailed(hosts) {
         // CPU
         console.log(`  CPU temp:     ${fmtTemp(s.cpu_temp_c)}`);
         if (cpu.cur_khz != null)
-            console.log(`  CPU freq:     ${fmtFreq(cpu.cur_khz)} / ${fmtFreq(cpu.max_khz)}${cpu.throttled ? ` ${C.yellow}THROTTLED${C.reset}` : ''}`);
-        if (cpu.rpi_undervoltage)
-            console.log(`  ${C.red}⚠ RPi undervoltage detected${C.reset}`);
-        if (cpu.rpi_throttled_occurred)
-            console.log(`  ${C.yellow}⚠ RPi throttling has occurred${C.reset}`);
+            console.log(
+                `  CPU freq:     ${fmtFreq(cpu.cur_khz)} / ${fmtFreq(cpu.max_khz)} (${cpu.governor || '?'})${cpu.throttled ? ` ${C.yellow}THROTTLED${C.reset}` : ''}`
+            );
+        if (cpu.rpi_undervoltage) console.log(`  ${C.red}⚠ RPi undervoltage detected${C.reset}`);
+        if (cpu.rpi_throttled_occurred) console.log(`  ${C.yellow}⚠ RPi throttling has occurred${C.reset}`);
 
         // Load
-        if (s.load)
-            console.log(`  Load:         ${s.load['1min']} / ${s.load['5min']} / ${s.load['15min']}`);
+        if (s.load) console.log(`  Load:         ${s.load['1min']} / ${s.load['5min']} / ${s.load['15min']}`);
 
         // Memory
         console.log(`  Memory:       ${fmtKb(mem.total_kb)} total, ${fmtKb(mem.available_kb)} avail, ${fmtPct(mem.used_pct)} used`);
@@ -278,27 +306,28 @@ function showSystemDetailed(hosts) {
             console.log(`  Swap:         ${fmtKb(mem.swap_total_kb)} total, ${fmtKb(mem.swap_free_kb)} free, ${fmtPct(mem.swap_used_pct)} used`);
 
         // Disk
-        console.log(`  Disk:         ${disk.total_mb || '?'}MB total, ${disk.used_mb || '?'}MB used, ${fmtPct(disk.used_pct)} used${disk.readonly ? ` ${C.red}READONLY${C.reset}` : ''}`);
+        console.log(
+            `  Disk:         ${disk.total_mb || '?'}MB total, ${disk.used_mb || '?'}MB used, ${fmtPct(disk.used_pct)} used${disk.readonly ? ` ${C.red}READONLY${C.reset}` : ''}`
+        );
 
         // Network
-        for (const n of (s.network || [])) {
+        for (const n of s.network || []) {
             const status = n.up ? `${C.green}UP${C.reset}` : `${C.red}DOWN${C.reset}`;
             console.log(`  Network ${n.name}: ${status}, ip=${n.ip || 'none'}, ${n.type}`);
             if (n.type === 'ethernet')
                 console.log(`    Speed:      ${n.speed_mbps || '?'}Mbps ${n.duplex || ''}, MTU=${n.mtu || '?'}, carrier_changes=${n.carrier_changes ?? '?'}`);
-            if (n.type === 'wifi')
-                console.log(`    WiFi:       ${n.ssid || '?'}, ${n.signal_dbm || '?'}dBm, ${n.frequency || '?'}`);
+            if (n.type === 'wifi') console.log(`    WiFi:       ${n.ssid || '?'}, ${n.signal_dbm || '?'}dBm, ${n.frequency || '?'}`);
             console.log(`    RX:         ${fmtBytes(n.rx_bytes)} (${n.rx_packets ?? '?'} pkts, ${n.rx_errors ?? 0} err, ${n.rx_dropped ?? 0} drop)`);
             console.log(`    TX:         ${fmtBytes(n.tx_bytes)} (${n.tx_packets ?? '?'} pkts, ${n.tx_errors ?? 0} err, ${n.tx_dropped ?? 0} drop)`);
         }
 
         // MQTT
-        console.log(`  MQTT:         ${indicator(mq.connected)} connects=${mq.connects ?? '?'}, disconnects=${mq.disconnects ?? 0}, reconnects=${mq.reconnects ?? 0}`);
+        console.log(
+            `  MQTT:         ${indicator(mq.connected)} connects=${mq.connects ?? '?'}, disconnects=${mq.disconnects ?? 0}, reconnects=${mq.reconnects ?? 0}`
+        );
         console.log(`    Published:  ${mq.publishes ?? '?'} msgs, ${fmtBytes(mq.publish_bytes)}, errors=${mq.publish_errors ?? 0}`);
-        if (mq.last_connect_time)
-            console.log(`    Connected:  ${mq.last_connect_time} (${timeAge(mq.last_connect_time)})`);
-        if (mq.last_publish_time)
-            console.log(`    Last pub:   ${mq.last_publish_time} (${timeAge(mq.last_publish_time)})`);
+        if (mq.last_connect_time) console.log(`    Connected:  ${mq.last_connect_time} (${timeAge(mq.last_connect_time)})`);
+        if (mq.last_publish_time) console.log(`    Last pub:   ${mq.last_publish_time} (${timeAge(mq.last_publish_time)})`);
 
         // Timesync
         const syncStr = ts.synchronized != null ? indicator(ts.synchronized) : '-';
@@ -309,11 +338,12 @@ function showSystemDetailed(hosts) {
         console.log(tsDetail);
 
         // Gateway
-        console.log(`  Gateway:      ${gw.ip || 'none'} via ${gw.interface || '?'}, ${gw.reachable ? `${C.green}reachable${C.reset} (${gw.rtt_ms != null ? gw.rtt_ms + 'ms' : ''})` : `${C.red}unreachable${C.reset}`}`);
+        console.log(
+            `  Gateway:      ${gw.ip || 'none'} via ${gw.interface || '?'}, ${gw.reachable ? `${C.green}reachable${C.reset} (${gw.rtt_ms != null ? gw.rtt_ms + 'ms' : ''})` : `${C.red}unreachable${C.reset}`}`
+        );
 
         // DNS
-        if (dns.check_host)
-            console.log(`  DNS:          ${indicator(dns.ok)} ${dns.check_host} -> ${dns.resolved_ip || 'FAILED'}`);
+        if (dns.check_host) console.log(`  DNS:          ${indicator(dns.ok)} ${dns.check_host} -> ${dns.resolved_ip || 'FAILED'}`);
 
         // USB
         if (s.usb && s.usb.length > 0) {
@@ -327,18 +357,28 @@ function showSystemDetailed(hosts) {
         // Processes
         if (s.processes && s.processes.length > 0) {
             console.log(`  Processes:    (${s.processes.length})`);
-            const procCols = [['NAME', 20], ['PID', 7], ['RSS', 8], ['CPU', 10], ['UPTIME', 10], ['STATUS', 7]];
+            const procCols = [
+                ['NAME', 20],
+                ['PID', 7],
+                ['RSS', 8],
+                ['CPU', 10],
+                ['UPTIME', 10],
+                ['STATUS', 7],
+            ];
             console.log(`    ${C.dim}${procCols.map(([n, w]) => pad(n, w)).join('  ')}${C.reset}`);
             for (const p of s.processes) {
                 const status = p.running ? `${C.green}UP${C.reset}` : `${C.red}DOWN${C.reset}`;
-                console.log('    ' + [
-                    pad(p.name, procCols[0][1]),
-                    rpad(p.running ? String(p.pid) : '-', procCols[1][1]),
-                    rpad(p.running ? fmtKb(p.rss_kb) : '-', procCols[2][1]),
-                    rpad(p.cpu_secs != null ? p.cpu_secs.toFixed(1) + 's' : '-', procCols[3][1]),
-                    pad(p.uptime_secs != null ? ago(p.uptime_secs) : '-', procCols[4][1]),
-                    pad(status, procCols[5][1]),
-                ].join('  '));
+                console.log(
+                    '    ' +
+                        [
+                            pad(p.name, procCols[0][1]),
+                            rpad(p.running ? String(p.pid) : '-', procCols[1][1]),
+                            rpad(p.running ? fmtKb(p.rss_kb) : '-', procCols[2][1]),
+                            rpad(p.cpu_secs != null ? p.cpu_secs.toFixed(1) + 's' : '-', procCols[3][1]),
+                            pad(p.uptime_secs != null ? ago(p.uptime_secs) : '-', procCols[4][1]),
+                            pad(status, procCols[5][1]),
+                        ].join('  ')
+                );
             }
         }
 
@@ -391,4 +431,3 @@ client.on('offline', () => {
     console.error(`Cannot connect to ${opts.server}`);
     process.exit(1);
 });
-

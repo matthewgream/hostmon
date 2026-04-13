@@ -767,6 +767,10 @@ static bool get_rpi_throttled(uint64_t *flags) {
     return read_file_uint64("/sys/devices/platform/soc/soc:firmware/get_throttled", flags);
 }
 
+static bool get_cpu_governor(char *buf, size_t size) {
+    return read_file_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", buf, size);
+}
+
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static cJSON *mmc_health_build_json(void) {
@@ -987,10 +991,19 @@ static cJSON *build_system_json(void) {
             cJSON_AddNumberToObject(cpu, "cur_khz", (double)cpu_cur_khz);
         if (cpu_max_khz > 0)
             cJSON_AddNumberToObject(cpu, "max_khz", (double)cpu_max_khz);
-        if (cpu_cur_khz > 0 && cpu_max_khz > 0)
-            cJSON_AddBoolToObject(cpu, "throttled", cpu_cur_khz < cpu_max_khz);
-        uint64_t rpi_flags;
-        if (get_rpi_throttled(&rpi_flags)) {
+        char governor[32];
+        const bool have_governor = get_cpu_governor(governor, sizeof(governor));
+        if (have_governor)
+            cJSON_AddStringToObject(cpu, "governor", governor);
+        uint64_t rpi_flags = 0;
+        const bool have_rpi = get_rpi_throttled(&rpi_flags);
+        bool throttled = false;
+        if (have_rpi && rpi_flags != 0)
+            throttled = (rpi_flags & 0x6) != 0;
+        else if (cpu_cur_khz > 0 && cpu_max_khz > 0 && cpu_cur_khz < cpu_max_khz)
+            throttled = have_governor && strcmp(governor, "performance") == 0;
+        cJSON_AddBoolToObject(cpu, "throttled", throttled);
+        if (have_rpi) {
             // bit 0: under-voltage now, 1: freq capped now, 2: throttled now, 3: soft temp limit now
             // bit 16: under-voltage occurred, 17: freq capped occurred, 18: throttled occurred, 19: soft temp limit occurred
             cJSON_AddNumberToObject(cpu, "rpi_throttled_flags", (double)rpi_flags);
