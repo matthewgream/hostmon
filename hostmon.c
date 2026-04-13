@@ -69,6 +69,8 @@ volatile bool running = true;
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+#define HOSTMON_VERSION                  "1.0.0"
+
 #define CONFIG_FILE_DEFAULT              "hostmon.cfg"
 
 #define MQTT_CLIENT_DEFAULT              "hostmon"
@@ -694,14 +696,14 @@ static bool get_cpu_temp(double *temp) {
     return false;
 }
 
-static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t *free_kb) {
+static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t *free_kb, uint64_t *swap_total_kb, uint64_t *swap_free_kb) {
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f)
         return false;
     char line[128];
     int found = 0;
-    *total_kb = *available_kb = *free_kb = 0;
-    while (fgets(line, (int)sizeof(line), f) && found < 3) {
+    *total_kb = *available_kb = *free_kb = *swap_total_kb = *swap_free_kb = 0;
+    while (fgets(line, (int)sizeof(line), f) && found < 5) {
         unsigned long val;
         if (sscanf(line, "MemTotal: %lu", &val) == 1) {
             *total_kb = (uint64_t)val;
@@ -712,10 +714,73 @@ static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t
         } else if (sscanf(line, "MemFree: %lu", &val) == 1) {
             *free_kb = (uint64_t)val;
             found++;
+        } else if (sscanf(line, "SwapTotal: %lu", &val) == 1) {
+            *swap_total_kb = (uint64_t)val;
+            found++;
+        } else if (sscanf(line, "SwapFree: %lu", &val) == 1) {
+            *swap_free_kb = (uint64_t)val;
+            found++;
         }
     }
     fclose(f);
-    return found >= 2;
+    return *total_kb > 0;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool get_cpu_freq(uint64_t *cur_khz, uint64_t *max_khz) {
+    *cur_khz = *max_khz = 0;
+    read_file_uint64("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", cur_khz);
+    read_file_uint64("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", max_khz);
+    return *cur_khz > 0 || *max_khz > 0;
+}
+
+static bool get_rpi_throttled(uint64_t *flags) {
+    return read_file_uint64("/sys/devices/platform/soc/soc:firmware/get_throttled", flags);
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *mmc_health_build_json(void) {
+    cJSON *arr = NULL;
+    DIR *d = opendir("/sys/block");
+    if (!d)
+        return NULL;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, "mmcblk", 6) != 0)
+            continue;
+        // only root devices (e.g. mmcblk0), skip partitions (mmcblk0p1)
+        if (strchr(ent->d_name, 'p') != NULL)
+            continue;
+        char path[PATH_MAX], buf[128];
+        snprintf(path, sizeof(path), "/sys/block/%s/device/life_time", ent->d_name);
+        if (!read_file_line(path, buf, sizeof(buf)))
+            continue;
+        unsigned int type_a = 0, type_b = 0;
+        if (sscanf(buf, "%x %x", &type_a, &type_b) < 1)
+            continue;
+        if (!arr)
+            arr = cJSON_CreateArray();
+        cJSON *dev = cJSON_CreateObject();
+        cJSON_AddStringToObject(dev, "name", ent->d_name);
+        cJSON_AddNumberToObject(dev, "life_time_a", (double)type_a);
+        cJSON_AddNumberToObject(dev, "life_time_b", (double)type_b);
+        // map: 0x01=0-10%, 0x02=10-20%, ... 0x0B=90-100%
+        if (type_a >= 1 && type_a <= 0x0B)
+            cJSON_AddNumberToObject(dev, "used_pct_max_a", (double)(type_a * 10));
+        if (type_b >= 1 && type_b <= 0x0B)
+            cJSON_AddNumberToObject(dev, "used_pct_max_b", (double)(type_b * 10));
+        snprintf(path, sizeof(path), "/sys/block/%s/device/pre_eol_info", ent->d_name);
+        if (read_file_line(path, buf, sizeof(buf))) {
+            unsigned int eol = 0;
+            if (sscanf(buf, "%x", &eol) == 1)
+                cJSON_AddNumberToObject(dev, "pre_eol_info", (double)eol);
+        }
+        cJSON_AddItemToArray(arr, dev);
+    }
+    closedir(d);
+    return arr;
 }
 
 static bool get_load_averages(double *load1, double *load5, double *load15) {
@@ -769,8 +834,10 @@ static bool check_dns_resolution(const char *hostname, char *result_ip, size_t r
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool get_default_gateway(char *gw_buf, size_t gw_size) {
+static bool get_default_gateway(char *gw_buf, size_t gw_size, char *iface_buf, size_t iface_size) {
     gw_buf[0] = '\0';
+    if (iface_buf && iface_size > 0)
+        iface_buf[0] = '\0';
     FILE *f = fopen("/proc/net/route", "r");
     if (!f)
         return false;
@@ -786,6 +853,8 @@ static bool get_default_gateway(char *gw_buf, size_t gw_size) {
             if (dest == 0 && gateway != 0) {
                 const struct in_addr addr = { .s_addr = (in_addr_t)gateway };
                 inet_ntop(AF_INET, &addr, gw_buf, (socklen_t)gw_size);
+                if (iface_buf && iface_size > 0)
+                    string_memcpy(iface_buf, iface_size, iface);
                 break;
             }
     }
@@ -868,14 +937,42 @@ static cJSON *build_system_json(void) {
     }
 
     // show memory
-    uint64_t mem_total_kb, mem_available_kb, mem_free_kb;
-    if (get_memory_info(&mem_total_kb, &mem_available_kb, &mem_free_kb)) {
+    uint64_t mem_total_kb, mem_available_kb, mem_free_kb, swap_total_kb, swap_free_kb;
+    if (get_memory_info(&mem_total_kb, &mem_available_kb, &mem_free_kb, &swap_total_kb, &swap_free_kb)) {
         cJSON *mem = cJSON_AddObjectToObject(root, "memory");
         cJSON_AddNumberToObject(mem, "total_kb", (double)mem_total_kb);
         cJSON_AddNumberToObject(mem, "available_kb", (double)mem_available_kb);
         cJSON_AddNumberToObject(mem, "free_kb", (double)mem_free_kb);
         if (mem_total_kb > 0)
             cJSON_AddNumberToObject(mem, "used_pct", round(1000.0 * (double)(mem_total_kb - mem_available_kb) / (double)mem_total_kb) / 10.0);
+        cJSON_AddNumberToObject(mem, "swap_total_kb", (double)swap_total_kb);
+        cJSON_AddNumberToObject(mem, "swap_free_kb", (double)swap_free_kb);
+        if (swap_total_kb > 0)
+            cJSON_AddNumberToObject(mem, "swap_used_pct", round(1000.0 * (double)(swap_total_kb - swap_free_kb) / (double)swap_total_kb) / 10.0);
+    }
+
+    // show cpu frequency / throttling
+    uint64_t cpu_cur_khz, cpu_max_khz;
+    if (get_cpu_freq(&cpu_cur_khz, &cpu_max_khz)) {
+        cJSON *cpu = cJSON_AddObjectToObject(root, "cpu");
+        if (cpu_cur_khz > 0)
+            cJSON_AddNumberToObject(cpu, "cur_khz", (double)cpu_cur_khz);
+        if (cpu_max_khz > 0)
+            cJSON_AddNumberToObject(cpu, "max_khz", (double)cpu_max_khz);
+        if (cpu_cur_khz > 0 && cpu_max_khz > 0)
+            cJSON_AddBoolToObject(cpu, "throttled", cpu_cur_khz < cpu_max_khz);
+        uint64_t rpi_flags;
+        if (get_rpi_throttled(&rpi_flags)) {
+            // bit 0: under-voltage now, 1: freq capped now, 2: throttled now, 3: soft temp limit now
+            // bit 16: under-voltage occurred, 17: freq capped occurred, 18: throttled occurred, 19: soft temp limit occurred
+            cJSON_AddNumberToObject(cpu, "rpi_throttled_flags", (double)rpi_flags);
+            cJSON_AddBoolToObject(cpu, "rpi_undervoltage", (rpi_flags & 0x1) != 0);
+            cJSON_AddBoolToObject(cpu, "rpi_freq_capped", (rpi_flags & 0x2) != 0);
+            cJSON_AddBoolToObject(cpu, "rpi_throttled_now", (rpi_flags & 0x4) != 0);
+            cJSON_AddBoolToObject(cpu, "rpi_soft_temp_limit", (rpi_flags & 0x8) != 0);
+            cJSON_AddBoolToObject(cpu, "rpi_undervoltage_occurred", (rpi_flags & 0x10000) != 0);
+            cJSON_AddBoolToObject(cpu, "rpi_throttled_occurred", (rpi_flags & 0x40000) != 0);
+        }
     }
 
     // show network interfaces
@@ -886,7 +983,17 @@ static cJSON *build_system_json(void) {
     // show mqtt connection status
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddBoolToObject(mqtt, "connected", mqtt_is_connected());
+    cJSON_AddNumberToObject(mqtt, "connects", (double)mqtt_stat_connects);
     cJSON_AddNumberToObject(mqtt, "disconnects", (double)mqtt_stat_disconnects);
+    cJSON_AddNumberToObject(mqtt, "reconnects", (double)mqtt_stat_reconnects);
+    cJSON_AddNumberToObject(mqtt, "publishes", (double)mqtt_stat_publishes);
+    cJSON_AddNumberToObject(mqtt, "publish_bytes", (double)mqtt_stat_publish_bytes);
+    cJSON_AddNumberToObject(mqtt, "publish_errors", (double)mqtt_stat_publish_errors);
+    if (mqtt_stat_last_connect_time > 0) {
+        char ts[32];
+        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&mqtt_stat_last_connect_time));
+        cJSON_AddStringToObject(mqtt, "last_connect_time", ts);
+    }
 
     // show disk usage (root filesystem)
     uint64_t disk_total_mb, disk_used_mb, disk_avail_mb;
@@ -899,6 +1006,11 @@ static cJSON *build_system_json(void) {
             cJSON_AddNumberToObject(disk, "used_pct", round(1000.0 * (double)disk_used_mb / (double)disk_total_mb) / 10.0);
         cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
     }
+
+    // show eMMC/SD health
+    cJSON *mmc = mmc_health_build_json();
+    if (mmc)
+        cJSON_AddItemToObject(root, "mmc", mmc);
 
     // show USB devices
     cJSON *usb = usbdevs_build_json();
@@ -922,9 +1034,11 @@ static cJSON *build_system_json(void) {
     // check gateway reachability
     if (state.check_gateway) {
         cJSON *gateway = cJSON_AddObjectToObject(root, "gateway");
-        char gw_ip[INET_ADDRSTRLEN];
-        if (get_default_gateway(gw_ip, sizeof(gw_ip))) {
+        char gw_ip[INET_ADDRSTRLEN], gw_iface[INTERFACE_NAME_MAX];
+        if (get_default_gateway(gw_ip, sizeof(gw_ip), gw_iface, sizeof(gw_iface))) {
             cJSON_AddStringToObject(gateway, "ip", gw_ip);
+            if (gw_iface[0])
+                cJSON_AddStringToObject(gateway, "interface", gw_iface);
             cJSON_AddBoolToObject(gateway, "reachable", ping_host(gw_ip));
         } else {
             cJSON_AddStringToObject(gateway, "ip", "none");
@@ -957,6 +1071,7 @@ static cJSON *build_platform_json(void) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "timestamp", get_timestamp_iso8601());
     cJSON_AddStringToObject(root, "type", "platform");
+    cJSON_AddStringToObject(root, "hostmon_version", HOSTMON_VERSION);
 
     cJSON_AddStringToObject(root, "hostname", uts.nodename);
     cJSON_AddStringToObject(root, "kernel", uts.release);

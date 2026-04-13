@@ -21,6 +21,7 @@ typedef struct {
     bool tls_insecure;
     unsigned int reconnect_delay;
     unsigned int reconnect_delay_max;
+    bool debug;
 } mqtt_config_t;
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -29,8 +30,13 @@ struct mosquitto *mosq = NULL;
 void (*mqtt_message_callback)(const char *, const unsigned char *, const int) = NULL;
 bool mqtt_synchronous = false;
 bool mqtt_connected = false;
+uint32_t mqtt_stat_connects = 0;
 uint32_t mqtt_stat_disconnects = 0;
 uint32_t mqtt_stat_reconnects = 0;
+time_t mqtt_stat_last_connect_time = 0;
+uint32_t mqtt_stat_publishes = 0;
+uint64_t mqtt_stat_publish_bytes = 0;
+uint32_t mqtt_stat_publish_errors = 0;
 
 static unsigned int mqtt_reconnect_delay_base = 0;
 static unsigned int mqtt_reconnect_delay_max_base = 0;
@@ -40,13 +46,18 @@ static time_t mqtt_reconnect_next_attempt = 0;
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 bool mqtt_send(const char *topic, const char *message, const int length) {
-    if (!mosq || !mqtt_connected)
+    if (!mosq || !mqtt_connected) {
+        mqtt_stat_publish_errors++;
         return false;
+    }
     const int result = mosquitto_publish(mosq, NULL, topic, length, message, MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN);
     if (result != MOSQ_ERR_SUCCESS) {
+        mqtt_stat_publish_errors++;
         fprintf(stderr, "mqtt: publish error: %s\n", mosquitto_strerror(result));
         return false;
     }
+    mqtt_stat_publishes++;
+    mqtt_stat_publish_bytes += (uint64_t)length;
     return true;
 }
 
@@ -120,6 +131,8 @@ static void __mqtt_connect_callback(struct mosquitto *m, void *o __attribute__((
         return;
     }
     mqtt_connected = true;
+    mqtt_stat_connects++;
+    mqtt_stat_last_connect_time = time(NULL);
     mqtt_reconnect_delay_current = mqtt_reconnect_delay_base;
     mqtt_reconnect_next_attempt = 0;
     printf("mqtt: connected\n");
