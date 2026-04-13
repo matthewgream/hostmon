@@ -14,7 +14,7 @@ const opts = {
     mode: 'system',
     detailed: false,
     server: process.env.MQTT_SERVER || 'mqtt://localhost:1883',
-    topic: process.env.HOSTMON_TOPIC || 'hostmon/#',
+    topic: process.env.HOSTMON_TOPIC || 'system/monitor/#',
     timeout: 2000,
     hosts: [],
 };
@@ -35,7 +35,7 @@ Options:
   --system, -s      Show system (dynamic) info (default)
   --detailed, -d    Show detailed output
   --server URL      MQTT server (default: mqtt://localhost:1883)
-  --topic TOPIC     MQTT topic (default: hostmon/#)
+  --topic TOPIC     MQTT topic (default: system/monitor/#)
   --timeout MS      Wait time for retained messages (default: 2000)
   --help, -h        Show this help
 
@@ -56,8 +56,8 @@ const data = {}; // { hostname: { platform: {}, system: {} } }
 function onMessage(topic, payload) {
     const parts = topic.split('/');
     if (parts.length < 3) return;
-    const hostname = parts[1];
-    const type = parts[2];
+    const hostname = parts[parts.length - 2];
+    const type = parts[parts.length - 1];
     if (type !== 'platform' && type !== 'system') return;
     if (opts.hosts.length > 0 && !opts.hosts.some((h) => hostname.toLowerCase().startsWith(h))) return;
     try {

@@ -77,7 +77,7 @@ volatile bool running = true;
 #define MQTT_SERVER_DEFAULT              "mqtt://localhost"
 #define MQTT_TLS_DEFAULT                 false
 #define MQTT_SYNCHRONOUS_DEFAULT         true
-#define MQTT_TOPIC_PREFIX_DEFAULT        "hostmon"
+#define MQTT_TOPIC_PREFIX_DEFAULT        "system/monitor"
 #define MQTT_RECONNECT_DELAY_DEFAULT     5
 #define MQTT_RECONNECT_DELAY_MAX_DEFAULT 60
 
