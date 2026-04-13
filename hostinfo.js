@@ -70,12 +70,8 @@ function onMessage(topic, payload) {
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-function stripAnsi(s) {
-    return s.replace(/\x1b\[[0-9;]*m/g, '');
-}
-function visLen(s) {
-    return stripAnsi(String(s)).length;
-}
+function stripAnsi(s) { return s.replace(/\x1b\[[0-9;]*m/g, ''); }
+function visLen(s) { return stripAnsi(String(s)).length; }
 function pad(s, n, right) {
     s = String(s ?? '');
     const vl = visLen(s);
@@ -214,7 +210,7 @@ function showSystemSummary(hosts) {
     const cols = [
         ['HOST', 22],
         ['UPTIME', 8],
-        ['CPU', 7],
+        ['CPU', 8],
         ['LOAD', 6],
         ['MEM', 12],
         ['SWAP', 7],
@@ -251,7 +247,7 @@ function showSystemSummary(hosts) {
         const swapStr = mem.swap_total_kb > 0 ? fmtPct(mem.swap_used_pct) : '-';
         const diskStr = `${fmtPct(disk.used_pct)} ${disk.total_mb ? Math.round(disk.total_mb / 1024) + 'G' : ''}`;
         const loadStr = s.load ? s.load['1min'].toFixed(2) : '-';
-        const cpuStr = cpu.throttled ? `${C.yellow}${fmtTemp(s.cpu_temp_c)}⚡${C.reset}` : fmtTemp(s.cpu_temp_c);
+        const cpuStr = cpu.throttled ? `${C.yellow}${fmtTemp(s.cpu_temp_c)}!${C.reset}` : fmtTemp(s.cpu_temp_c);
         const gwStr = gw.reachable != null ? (gw.reachable ? `${gw.rtt_ms != null ? gw.rtt_ms.toFixed(0) + 'ms' : 'ok'}` : `${C.red}DOWN${C.reset}`) : '-';
 
         console.log(
