@@ -82,7 +82,7 @@ volatile bool running = true;
 #define MQTT_RECONNECT_DELAY_MAX_DEFAULT 60
 
 #define INTERVAL_PLATFORM_DEFAULT        (24 * 60 * 60)
-#define INTERVAL_SYSTEM_DEFAULT          60
+#define INTERVAL_SYSTEM_DEFAULT          (5 * 60)
 
 typedef int serial_bits_t;
 #define SERIAL_8N1 0
@@ -115,10 +115,10 @@ const config_option_help_t config_options_help[] = {
     {"mqtt-server",                     "MQTT server URL (default: " MQTT_SERVER_DEFAULT ")"},
     {"mqtt-topic-prefix",               "MQTT topic prefix (default: " MQTT_TOPIC_PREFIX_DEFAULT ")"},
     {"mqtt-tls-insecure",               "MQTT disable TLS verification (true/false)"},
-    {"mqtt-reconnect-delay",            "MQTT reconnect delay in seconds"},
-    {"mqtt-reconnect-delay-max",        "MQTT max reconnect delay in seconds"},
+    {"mqtt-reconnect-delay",            "MQTT reconnect delay in seconds (default: 5)"},
+    {"mqtt-reconnect-delay-max",        "MQTT max reconnect delay in seconds (default: 60)"},
     {"interval-platform",               "Platform info publish interval in seconds (default: 86400)"},
-    {"interval-system",                 "System info publish interval in seconds (default: 60)"},
+    {"interval-system",                 "System info publish interval in seconds (default: 300)"},
     {"check-processes",                 "Check list of processes (comma-separated) (default: unspecified)"},
     {"check-timesync",                  "Check time synchronisation (default: true)"},
     {"check-gateway",                   "Check ping to network gateway (default: true)"},
