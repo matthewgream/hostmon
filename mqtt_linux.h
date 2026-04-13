@@ -165,7 +165,7 @@ static void __mqtt_reconnect_attempt(void) {
         mqtt_reconnect_next_attempt = 0;
     } else {
         fprintf(stderr, "mqtt: reconnect failed: %s (next attempt in %us)\n", mosquitto_strerror(r), mqtt_reconnect_delay_current);
-        mqtt_reconnect_next_attempt = now + mqtt_reconnect_delay_current;
+        mqtt_reconnect_next_attempt = now + (time_t)mqtt_reconnect_delay_current;
         mqtt_reconnect_delay_current *= 2;
         if (mqtt_reconnect_delay_max_base > 0 && mqtt_reconnect_delay_current > mqtt_reconnect_delay_max_base)
             mqtt_reconnect_delay_current = mqtt_reconnect_delay_max_base;
