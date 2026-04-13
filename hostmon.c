@@ -167,6 +167,8 @@ typedef struct {
 
 static hostmon_state_t state;
 
+static time_t last_publish_time = 0;
+
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
@@ -211,10 +213,30 @@ static bool read_file_uint64(const char *path, uint64_t *val) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool ping_host(const char *host) {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s >/dev/null 2>&1", host);
-    return system(cmd) == 0;
+static bool ping_host(const char *host, double *rtt_ms) {
+    if (rtt_ms)
+        *rtt_ms = -1.0;
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s 2>/dev/null", host);
+    FILE *f = popen(cmd, "r");
+    if (!f)
+        return false;
+    char line[256];
+    bool ok = false;
+    while (fgets(line, (int)sizeof(line), f)) {
+        // "rtt min/avg/max/mdev = 0.123/0.456/0.789/0.012 ms"
+        const char *eq = strchr(line, '=');
+        if (eq && (strstr(line, "rtt ") == line || strstr(line, "round-trip") == line)) {
+            double mn, avg, mx, md;
+            if (sscanf(eq + 1, " %lf/%lf/%lf/%lf", &mn, &avg, &mx, &md) >= 2) {
+                if (rtt_ms)
+                    *rtt_ms = avg;
+                ok = true;
+            }
+        }
+    }
+    const int rc = pclose(f);
+    return ok || rc == 0;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -425,6 +447,12 @@ static cJSON *interfaces_build_json(const iface_state_t *iface) {
     int mtu;
     if (get_iface_mtu(iface->name, &mtu))
         cJSON_AddNumberToObject(obj, "mtu", mtu);
+
+    char path[PATH_MAX];
+    uint64_t carrier_changes;
+    snprintf(path, sizeof(path), "/sys/class/net/%s/carrier_changes", iface->name);
+    if (read_file_uint64(path, &carrier_changes))
+        cJSON_AddNumberToObject(obj, "carrier_changes", (double)carrier_changes);
 
     if (!iface->is_wifi) {
         int speed_mbps;
@@ -994,6 +1022,11 @@ static cJSON *build_system_json(void) {
         strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&mqtt_stat_last_connect_time));
         cJSON_AddStringToObject(mqtt, "last_connect_time", ts);
     }
+    if (last_publish_time > 0) {
+        char ts[32];
+        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&last_publish_time));
+        cJSON_AddStringToObject(mqtt, "last_publish_time", ts);
+    }
 
     // show disk usage (root filesystem)
     uint64_t disk_total_mb, disk_used_mb, disk_avail_mb;
@@ -1039,7 +1072,11 @@ static cJSON *build_system_json(void) {
             cJSON_AddStringToObject(gateway, "ip", gw_ip);
             if (gw_iface[0])
                 cJSON_AddStringToObject(gateway, "interface", gw_iface);
-            cJSON_AddBoolToObject(gateway, "reachable", ping_host(gw_ip));
+            double rtt_ms = -1.0;
+            const bool reachable = ping_host(gw_ip, &rtt_ms);
+            cJSON_AddBoolToObject(gateway, "reachable", reachable);
+            if (reachable && rtt_ms >= 0.0)
+                cJSON_AddNumberToObject(gateway, "rtt_ms", round(rtt_ms * 100.0) / 100.0);
         } else {
             cJSON_AddStringToObject(gateway, "ip", "none");
             cJSON_AddBoolToObject(gateway, "reachable", false);
@@ -1140,6 +1177,8 @@ static bool publish_json(const char *subtopic, cJSON *json) {
         snprintf(hostname, sizeof(hostname), "unknown");
     snprintf(topic, sizeof(topic), "%s/%s/%s", state.mqtt_topic_prefix, hostname, subtopic);
     const bool ok = mqtt_send(topic, str, (int)strlen(str));
+    if (ok)
+        last_publish_time = time(NULL);
     if (state.debug)
         printf("hostmon: publish %s (%d bytes) -> %s\n", subtopic, (int)strlen(str), ok ? "ok" : "FAILED");
     free(str);
