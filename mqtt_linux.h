@@ -2,6 +2,9 @@
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+#ifndef MQTT_LINUX_H
+#define MQTT_LINUX_H
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,78 +27,91 @@ typedef struct {
     bool debug;
 } mqtt_config_t;
 
+typedef void (*mqtt_message_handler_t)(void *user_data, const char *topic, const unsigned char *payload, int payloadlen);
+typedef void (*mqtt_connect_handler_t)(void *user_data, bool connected);
+
+typedef struct {
+    struct mosquitto *mosq;
+    bool synchronous;
+    bool connected;
+    uint32_t stat_connects;
+    uint32_t stat_disconnects;
+    uint32_t stat_reconnects;
+    time_t stat_last_connect_time;
+    uint32_t stat_publishes;
+    uint64_t stat_publish_bytes;
+    uint32_t stat_publish_errors;
+    mqtt_message_handler_t message_handler;
+    mqtt_connect_handler_t connect_handler;
+    void *handler_user_data;
+    unsigned int reconnect_delay_base;
+    unsigned int reconnect_delay_max_base;
+    unsigned int reconnect_delay_current;
+    time_t reconnect_next_attempt;
+    char log_prefix[16];
+} mqtt_context_t;
+
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-struct mosquitto *mosq = NULL;
-void (*mqtt_message_callback)(const char *, const unsigned char *, const int) = NULL;
-bool mqtt_synchronous = false;
-bool mqtt_connected = false;
-uint32_t mqtt_stat_connects = 0;
-uint32_t mqtt_stat_disconnects = 0;
-uint32_t mqtt_stat_reconnects = 0;
-time_t mqtt_stat_last_connect_time = 0;
-uint32_t mqtt_stat_publishes = 0;
-uint64_t mqtt_stat_publish_bytes = 0;
-uint32_t mqtt_stat_publish_errors = 0;
-
-static unsigned int mqtt_reconnect_delay_base = 0;
-static unsigned int mqtt_reconnect_delay_max_base = 0;
-static unsigned int mqtt_reconnect_delay_current = 0;
-static time_t mqtt_reconnect_next_attempt = 0;
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
-bool mqtt_send(const char *topic, const char *message, const int length) {
-    if (!mosq || !mqtt_connected) {
-        mqtt_stat_publish_errors++;
+static bool mqtt_send(mqtt_context_t *ctx, const char *topic, const char *message, const int length) {
+    if (!ctx->mosq || !ctx->connected) {
+        ctx->stat_publish_errors++;
         return false;
     }
-    const int result = mosquitto_publish(mosq, NULL, topic, length, message, MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN);
+    const int result = mosquitto_publish(ctx->mosq, NULL, topic, length, message, MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN);
     if (result != MOSQ_ERR_SUCCESS) {
-        mqtt_stat_publish_errors++;
-        fprintf(stderr, "mqtt: publish error: %s\n", mosquitto_strerror(result));
+        ctx->stat_publish_errors++;
+        fprintf(stderr, "%s: publish error: %s\n", ctx->log_prefix, mosquitto_strerror(result));
         return false;
     }
-    mqtt_stat_publishes++;
-    mqtt_stat_publish_bytes += (uint64_t)length;
+    ctx->stat_publishes++;
+    ctx->stat_publish_bytes += (uint64_t)length;
     return true;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static void __mqtt_message_callback_wrapper(struct mosquitto *m, void *o __attribute__((unused)), const struct mosquitto_message *message) {
-    if (m != mosq)
+static void __mqtt_message_callback_wrapper(struct mosquitto *m __attribute__((unused)), void *userdata, const struct mosquitto_message *message) {
+    mqtt_context_t *ctx = (mqtt_context_t *)userdata;
+    if (!ctx)
         return;
-    if (mqtt_message_callback)
-        mqtt_message_callback((const char *)message->topic, message->payload, message->payloadlen);
+    if (ctx->message_handler)
+        ctx->message_handler(ctx->handler_user_data, (const char *)message->topic, message->payload, message->payloadlen);
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-bool mqtt_subscribe(const char *topic, const int qos, void (*callback)(const char *, const unsigned char *, const int)) {
-    if (!mosq)
+static void mqtt_set_handlers(mqtt_context_t *ctx, mqtt_message_handler_t msg_cb, mqtt_connect_handler_t conn_cb, void *user_data) {
+    ctx->message_handler = msg_cb;
+    ctx->connect_handler = conn_cb;
+    ctx->handler_user_data = user_data;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool mqtt_subscribe(mqtt_context_t *ctx, const char *topic, const int qos) {
+    if (!ctx->mosq)
         return false;
-    mqtt_message_callback = callback;
-    const int result = mosquitto_subscribe(mosq, NULL, topic, qos);
+    const int result = mosquitto_subscribe(ctx->mosq, NULL, topic, qos);
     if (result != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "mqtt: subscribe error: %s\n", mosquitto_strerror(result));
+        fprintf(stderr, "%s: subscribe error: %s\n", ctx->log_prefix, mosquitto_strerror(result));
         return false;
     }
-    printf("mqtt: subscribed to topic '%s' (qos=%d)\n", topic, qos);
+    printf("%s: subscribed to topic '%s' (qos=%d)\n", ctx->log_prefix, topic, qos);
     return true;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-bool mqtt_unsubscribe(const char *topic) {
-    if (!mosq)
+__attribute__((unused)) static bool mqtt_unsubscribe(mqtt_context_t *ctx, const char *topic) {
+    if (!ctx->mosq)
         return false;
-    const int result = mosquitto_unsubscribe(mosq, NULL, topic);
+    const int result = mosquitto_unsubscribe(ctx->mosq, NULL, topic);
     if (result != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "mqtt: unsubscribe error: %s\n", mosquitto_strerror(result));
+        fprintf(stderr, "%s: unsubscribe error: %s\n", ctx->log_prefix, mosquitto_strerror(result));
         return false;
     }
-    printf("mqtt: unsubscribed from topic '%s'\n", topic);
+    printf("%s: unsubscribed from topic '%s'\n", ctx->log_prefix, topic);
     return true;
 }
 
@@ -123,143 +139,155 @@ static bool __mqtt_parse(const char *string, char *host, const int length, int *
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static void __mqtt_connect_callback(struct mosquitto *m, void *o __attribute__((unused)), int r) {
-    if (m != mosq)
+static void __mqtt_connect_callback(struct mosquitto *m __attribute__((unused)), void *userdata, int r) {
+    mqtt_context_t *ctx = (mqtt_context_t *)userdata;
+    if (!ctx)
         return;
     if (r != 0) {
-        fprintf(stderr, "mqtt: connect failed: %s\n", mosquitto_connack_string(r));
+        fprintf(stderr, "%s: connect failed: %s\n", ctx->log_prefix, mosquitto_connack_string(r));
         return;
     }
-    mqtt_connected = true;
-    mqtt_stat_connects++;
-    mqtt_stat_last_connect_time = time(NULL);
-    mqtt_reconnect_delay_current = mqtt_reconnect_delay_base;
-    mqtt_reconnect_next_attempt = 0;
-    printf("mqtt: connected\n");
+    ctx->connected = true;
+    ctx->stat_connects++;
+    ctx->stat_last_connect_time = time(NULL);
+    ctx->reconnect_delay_current = ctx->reconnect_delay_base;
+    ctx->reconnect_next_attempt = 0;
+    printf("%s: connected\n", ctx->log_prefix);
+    if (ctx->connect_handler)
+        ctx->connect_handler(ctx->handler_user_data, true);
 }
 
-static void __mqtt_disconnect_callback(struct mosquitto *m, void *o __attribute__((unused)), int r) {
-    if (m != mosq)
+static void __mqtt_disconnect_callback(struct mosquitto *m __attribute__((unused)), void *userdata, int r) {
+    mqtt_context_t *ctx = (mqtt_context_t *)userdata;
+    if (!ctx)
         return;
-    mqtt_connected = false;
-    mqtt_stat_disconnects++;
+    ctx->connected = false;
+    ctx->stat_disconnects++;
     if (r == 0)
-        printf("mqtt: disconnected (clean)\n");
+        printf("%s: disconnected (clean)\n", ctx->log_prefix);
     else
-        fprintf(stderr, "mqtt: disconnected unexpectedly: rc=%d\n", r);
+        fprintf(stderr, "%s: disconnected unexpectedly: rc=%d\n", ctx->log_prefix, r);
+    if (ctx->connect_handler)
+        ctx->connect_handler(ctx->handler_user_data, false);
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static void __mqtt_reconnect_attempt(void) {
+static void __mqtt_reconnect_attempt(mqtt_context_t *ctx) {
     const time_t now = time(NULL);
-    if (now < mqtt_reconnect_next_attempt)
+    if (now < ctx->reconnect_next_attempt)
         return;
-    if (mqtt_reconnect_delay_current == 0)
-        mqtt_reconnect_delay_current = mqtt_reconnect_delay_base ? mqtt_reconnect_delay_base : 1;
-    printf("mqtt: attempting reconnect\n");
-    const int r = mosquitto_reconnect(mosq);
+    if (ctx->reconnect_delay_current == 0)
+        ctx->reconnect_delay_current = ctx->reconnect_delay_base ? ctx->reconnect_delay_base : 1;
+    printf("%s: attempting reconnect\n", ctx->log_prefix);
+    const int r = mosquitto_reconnect(ctx->mosq);
     if (r == MOSQ_ERR_SUCCESS) {
-        mqtt_stat_reconnects++;
-        mqtt_reconnect_delay_current = mqtt_reconnect_delay_base;
-        mqtt_reconnect_next_attempt = 0;
+        ctx->stat_reconnects++;
+        ctx->reconnect_delay_current = ctx->reconnect_delay_base;
+        ctx->reconnect_next_attempt = 0;
     } else {
-        fprintf(stderr, "mqtt: reconnect failed: %s (next attempt in %us)\n", mosquitto_strerror(r), mqtt_reconnect_delay_current);
-        mqtt_reconnect_next_attempt = now + (time_t)mqtt_reconnect_delay_current;
-        mqtt_reconnect_delay_current *= 2;
-        if (mqtt_reconnect_delay_max_base > 0 && mqtt_reconnect_delay_current > mqtt_reconnect_delay_max_base)
-            mqtt_reconnect_delay_current = mqtt_reconnect_delay_max_base;
+        fprintf(stderr, "%s: reconnect failed: %s (next attempt in %us)\n", ctx->log_prefix, mosquitto_strerror(r), ctx->reconnect_delay_current);
+        ctx->reconnect_next_attempt = now + (time_t)ctx->reconnect_delay_current;
+        ctx->reconnect_delay_current *= 2;
+        if (ctx->reconnect_delay_max_base > 0 && ctx->reconnect_delay_current > ctx->reconnect_delay_max_base)
+            ctx->reconnect_delay_current = ctx->reconnect_delay_max_base;
     }
 }
 
-void mqtt_loop(const int timeout_ms) {
-    if (!mosq)
+static void mqtt_loop(mqtt_context_t *ctx, const int timeout_ms) {
+    if (!ctx->mosq)
         return;
-    const int rc = mosquitto_loop(mosq, timeout_ms, 1);
+    const int rc = mosquitto_loop(ctx->mosq, timeout_ms, 1);
     if (rc != MOSQ_ERR_SUCCESS) {
-        if (mqtt_connected) {
-            mqtt_connected = false;
-            mqtt_stat_disconnects++;
-            fprintf(stderr, "mqtt: loop error: %s\n", mosquitto_strerror(rc));
+        if (ctx->connected) {
+            ctx->connected = false;
+            ctx->stat_disconnects++;
+            fprintf(stderr, "%s: loop error: %s\n", ctx->log_prefix, mosquitto_strerror(rc));
+            if (ctx->connect_handler)
+                ctx->connect_handler(ctx->handler_user_data, false);
         }
-        __mqtt_reconnect_attempt();
+        __mqtt_reconnect_attempt(ctx);
     }
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-bool mqtt_begin(const mqtt_config_t *cfg) {
+static bool mqtt_begin(mqtt_context_t *ctx, const mqtt_config_t *cfg) {
     char host[256];
     int port;
     bool ssl;
     if (!__mqtt_parse(cfg->server, host, sizeof(host), &port, &ssl)) {
-        fprintf(stderr, "mqtt: error parsing details in '%s'\n", cfg->server);
+        fprintf(stderr, "%s: error parsing details in '%s'\n", ctx->log_prefix, cfg->server);
         return false;
     }
-    printf("mqtt: connecting (host='%s', port=%d, ssl=%s, client='%s')\n", host, port, ssl ? "true" : "false", cfg->client);
+    if (ctx->log_prefix[0] == '\0')
+        snprintf(ctx->log_prefix, sizeof(ctx->log_prefix), "mqtt");
+    printf("%s: connecting (host='%s', port=%d, ssl=%s, client='%s')\n", ctx->log_prefix, host, port, ssl ? "true" : "false", cfg->client);
     char client_id[24];
     snprintf(client_id, sizeof(client_id), "%s-%06X", cfg->client ? cfg->client : "mqtt-linux", (unsigned int)(time(NULL) ^ getpid()) & 0xFFFFFF);
     mosquitto_lib_init();
-    mosq = mosquitto_new(client_id, true, NULL);
-    if (!mosq) {
-        fprintf(stderr, "mqtt: error creating client instance\n");
+    ctx->mosq = mosquitto_new(client_id, true, ctx);
+    if (!ctx->mosq) {
+        fprintf(stderr, "%s: error creating client instance\n", ctx->log_prefix);
         return false;
     }
     if (ssl) {
-        mosquitto_tls_set(mosq, NULL, NULL, NULL, NULL, NULL);
+        mosquitto_tls_set(ctx->mosq, NULL, NULL, NULL, NULL, NULL);
         if (cfg->tls_insecure) {
-            mosquitto_tls_insecure_set(mosq, true);
-            printf("mqtt: WARNING tls certificate validation disabled\n");
+            mosquitto_tls_insecure_set(ctx->mosq, true);
+            printf("%s: WARNING tls certificate validation disabled\n", ctx->log_prefix);
         }
     }
-    mosquitto_connect_callback_set(mosq, __mqtt_connect_callback);
-    mosquitto_disconnect_callback_set(mosq, __mqtt_disconnect_callback);
-    mosquitto_message_callback_set(mosq, __mqtt_message_callback_wrapper);
+    mosquitto_connect_callback_set(ctx->mosq, __mqtt_connect_callback);
+    mosquitto_disconnect_callback_set(ctx->mosq, __mqtt_disconnect_callback);
+    mosquitto_message_callback_set(ctx->mosq, __mqtt_message_callback_wrapper);
     if (cfg->reconnect_delay > 0)
-        mosquitto_reconnect_delay_set(mosq, cfg->reconnect_delay, cfg->reconnect_delay_max, true);
-    mqtt_reconnect_delay_base = cfg->reconnect_delay > 0 ? cfg->reconnect_delay : 1;
-    mqtt_reconnect_delay_max_base = cfg->reconnect_delay_max > 0 ? cfg->reconnect_delay_max : mqtt_reconnect_delay_base;
-    mqtt_reconnect_delay_current = mqtt_reconnect_delay_base;
-    mqtt_reconnect_next_attempt = 0;
+        mosquitto_reconnect_delay_set(ctx->mosq, cfg->reconnect_delay, cfg->reconnect_delay_max, true);
+    ctx->reconnect_delay_base = cfg->reconnect_delay > 0 ? cfg->reconnect_delay : 1;
+    ctx->reconnect_delay_max_base = cfg->reconnect_delay_max > 0 ? cfg->reconnect_delay_max : ctx->reconnect_delay_base;
+    ctx->reconnect_delay_current = ctx->reconnect_delay_base;
+    ctx->reconnect_next_attempt = 0;
     int result;
-    if ((result = mosquitto_connect(mosq, host, port, MQTT_CONNECT_TIMEOUT)) != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "mqtt: error connecting to broker: %s\n", mosquitto_strerror(result));
-        mosquitto_destroy(mosq);
-        mosq = NULL;
+    if ((result = mosquitto_connect(ctx->mosq, host, port, MQTT_CONNECT_TIMEOUT)) != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "%s: error connecting to broker: %s\n", ctx->log_prefix, mosquitto_strerror(result));
+        mosquitto_destroy(ctx->mosq);
+        ctx->mosq = NULL;
         return false;
     }
-    mqtt_synchronous = cfg->use_synchronous;
-    if (!mqtt_synchronous && (result = mosquitto_loop_start(mosq)) != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "mqtt: error starting loop: %s\n", mosquitto_strerror(result));
-        mosquitto_disconnect(mosq);
-        mosquitto_destroy(mosq);
-        mosq = NULL;
+    ctx->synchronous = cfg->use_synchronous;
+    if (!ctx->synchronous && (result = mosquitto_loop_start(ctx->mosq)) != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "%s: error starting loop: %s\n", ctx->log_prefix, mosquitto_strerror(result));
+        mosquitto_disconnect(ctx->mosq);
+        mosquitto_destroy(ctx->mosq);
+        ctx->mosq = NULL;
         return false;
     }
-    if (mqtt_synchronous)
-        for (int i = 0; i < 50 && !mqtt_connected; i++)
-            mosquitto_loop(mosq, 100, 1);
+    if (ctx->synchronous)
+        for (int i = 0; i < 50 && !ctx->connected; i++)
+            mosquitto_loop(ctx->mosq, 100, 1);
 
     return true;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-bool mqtt_is_connected(void) {
-    return mosq && mqtt_connected;
+static bool mqtt_is_connected(const mqtt_context_t *ctx) {
+    return ctx && ctx->mosq && ctx->connected;
 }
 
-void mqtt_end(void) {
-    mqtt_connected = false;
-    if (mosq) {
-        if (!mqtt_synchronous)
-            mosquitto_loop_stop(mosq, true);
-        mosquitto_disconnect(mosq);
-        mosquitto_destroy(mosq);
-        mosq = NULL;
+static void mqtt_end(mqtt_context_t *ctx) {
+    ctx->connected = false;
+    if (ctx->mosq) {
+        if (!ctx->synchronous)
+            mosquitto_loop_stop(ctx->mosq, true);
+        mosquitto_disconnect(ctx->mosq);
+        mosquitto_destroy(ctx->mosq);
+        ctx->mosq = NULL;
     }
     mosquitto_lib_cleanup();
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
+
+#endif /* MQTT_LINUX_H */

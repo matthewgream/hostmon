@@ -42,6 +42,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <math.h>
+#include <stdarg.h>
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -56,6 +57,61 @@
 
 #include <cjson/cJSON.h>
 
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+__attribute__((format(printf, 3, 4))) static const char *snprintf_inline(char *buf, size_t size, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+static const char *strtime_iso8601(const time_t t) {
+    static char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
+    return ts;
+}
+
+static void string_memcpy(char *buf, size_t len, const char *str) {
+    size_t str_len = strlen(str);
+    if (str_len >= len)
+        str_len = len - 1;
+    memcpy(buf, str, str_len);
+    buf[str_len] = '\0';
+}
+
+static const char *string_cleanup(char *str) {
+    size_t str_len = strlen(str);
+    while (str_len > 0 && (str[str_len - 1] == '\n' || str[str_len - 1] == '\r'))
+        str[--str_len] = '\0';
+    return str;
+}
+
+static bool read_file_line(const char *path, char *line_buf, size_t line_size) {
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    line_buf[0] = '\0';
+    if (fgets(line_buf, (int)line_size, f))
+        string_cleanup(line_buf);
+    fclose(f);
+    return line_buf[0] != '\0';
+}
+
+static bool read_file_uint64(const char *path, uint64_t *val) {
+    char buf[64];
+    if (!read_file_line(path, buf, sizeof(buf)))
+        return false;
+    char *end;
+    *val = strtoull(buf, &end, 10);
+    return *end == '\0' || *end == '\n';
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 volatile bool running = true;
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -65,6 +121,302 @@ volatile bool running = true;
 #define MQTT_PUBLISH_QOS     0
 #define MQTT_PUBLISH_RETAIN  true
 #include "mqtt_linux.h"
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+#define MQTTTOPICS_MAX_SUBS            16
+#define MQTTTOPICS_TOPIC_MAX           255
+#define MQTTTOPICS_HASHES_MAX          2048
+#define MQTTTOPICS_BUCKETS_1S          60
+#define MQTTTOPICS_BUCKETS_15M         288
+#define MQTTTOPICS_BUCKET_15M_SECS     900
+#define MQTTTOPICS_SERVER_DEFAULT      "mqtt://localhost:1883"
+#define MQTTTOPICS_CLIENT_SUFFIX       "-check"
+#define MQTTTOPICS_RECONNECT_DELAY     5
+#define MQTTTOPICS_RECONNECT_DELAY_MAX 60
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+typedef struct {
+    char topic[MQTTTOPICS_TOPIC_MAX + 1];
+    bool subscribed;
+    uint64_t messages;
+    uint64_t bytes;
+    time_t last_message_time;
+    uint32_t topic_hashes[MQTTTOPICS_HASHES_MAX];
+    int topic_hash_count;
+    bool topic_hashes_full;
+    uint32_t buckets_1s[MQTTTOPICS_BUCKETS_1S];
+    uint32_t buckets_15m[MQTTTOPICS_BUCKETS_15M];
+    time_t bucket_1s_last_sec;
+    time_t bucket_15m_last_slot;
+} mqtttopics_sub_t;
+
+typedef struct {
+    bool enabled;
+    char client_id_buf[64];
+    char server_buf[255 + 16]; // XXX
+    mqtt_config_t mqtt_config;
+    mqtt_context_t mqtt_ctx;
+    int subscription_count;
+    mqtttopics_sub_t subscriptions[MQTTTOPICS_MAX_SUBS];
+} mqtttopics_state_t;
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static uint32_t __mqtttopics_hash_create(const char *s) {
+    uint32_t h = 2166136261u; // FNV offset basis
+    while (*s) {
+        h ^= (uint32_t)(uint8_t)*s;
+        h *= 16777619u;
+        s++;
+    }
+    return h;
+}
+
+static int __mqtttopics_hash_search(const uint32_t *arr, int n, uint32_t key) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (arr[mid] < key)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static bool __mqtttopics_hash_insert(mqtttopics_sub_t *sub, uint32_t key) {
+    const int pos = __mqtttopics_hash_search(sub->topic_hashes, sub->topic_hash_count, key);
+    if (pos < sub->topic_hash_count && sub->topic_hashes[pos] == key)
+        return false;
+    if (sub->topic_hash_count >= MQTTTOPICS_HASHES_MAX) {
+        sub->topic_hashes_full = true;
+        return false;
+    }
+    if (pos < sub->topic_hash_count)
+        memmove(&sub->topic_hashes[pos + 1], &sub->topic_hashes[pos], (size_t)(sub->topic_hash_count - pos) * sizeof(uint32_t));
+    sub->topic_hashes[pos] = key;
+    sub->topic_hash_count++;
+    return true;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static void __mqtttopics_bucket_advance_1s(mqtttopics_sub_t *sub, time_t now) {
+    if (sub->bucket_1s_last_sec == 0)
+        sub->bucket_1s_last_sec = now;
+    else {
+        const time_t diff = now - sub->bucket_1s_last_sec;
+        if (diff > 0) {
+            if (diff >= MQTTTOPICS_BUCKETS_1S)
+                memset(sub->buckets_1s, 0, sizeof(sub->buckets_1s));
+            else
+                for (time_t i = 1; i <= diff; i++)
+                    sub->buckets_1s[(size_t)((sub->bucket_1s_last_sec + i) % MQTTTOPICS_BUCKETS_1S)] = 0;
+            sub->bucket_1s_last_sec = now;
+        }
+    }
+}
+
+static void __mqtttopics_bucket_advance_15m(mqtttopics_sub_t *sub, time_t now) {
+    if (sub->bucket_15m_last_slot == 0)
+        sub->bucket_15m_last_slot = (now / MQTTTOPICS_BUCKET_15M_SECS);
+    else {
+        const time_t diff = (now / MQTTTOPICS_BUCKET_15M_SECS) - sub->bucket_15m_last_slot;
+        if (diff > 0) {
+            if (diff >= MQTTTOPICS_BUCKETS_15M)
+                memset(sub->buckets_15m, 0, sizeof(sub->buckets_15m));
+            else
+                for (time_t i = 1; i <= diff; i++)
+                    sub->buckets_15m[(size_t)((sub->bucket_15m_last_slot + i) % MQTTTOPICS_BUCKETS_15M)] = 0;
+            sub->bucket_15m_last_slot = (now / MQTTTOPICS_BUCKET_15M_SECS);
+        }
+    }
+}
+
+static void __mqtttopics_bucket_record(mqtttopics_sub_t *sub, time_t now) {
+    __mqtttopics_bucket_advance_1s(sub, now);
+    sub->buckets_1s[(size_t)(now % MQTTTOPICS_BUCKETS_1S)]++;
+    __mqtttopics_bucket_advance_15m(sub, now);
+    sub->buckets_15m[(size_t)((now / MQTTTOPICS_BUCKET_15M_SECS) % MQTTTOPICS_BUCKETS_15M)]++;
+}
+
+#define _MIN(x, y) ((x) < (y) ? (x) : (y))
+static double __mqtttopics_rate_window(mqtttopics_sub_t *sub, time_t now, int window_secs) {
+    if (window_secs <= MQTTTOPICS_BUCKETS_1S) {
+        __mqtttopics_bucket_advance_1s(sub, now);
+        uint64_t sum = 0;
+        for (int i = 0; i < window_secs && (now - i) >= 0; i++)
+            sum += sub->buckets_1s[(size_t)((now - i) % MQTTTOPICS_BUCKETS_1S)];
+        return (double)sum / (double)window_secs;
+    } else {
+        __mqtttopics_bucket_advance_15m(sub, now);
+        const int slots = _MIN((window_secs + MQTTTOPICS_BUCKET_15M_SECS - 1) / MQTTTOPICS_BUCKET_15M_SECS, MQTTTOPICS_BUCKETS_15M);
+        uint64_t sum = 0;
+        for (int i = 0; i < slots && ((now / MQTTTOPICS_BUCKET_15M_SECS) - i) >= 0; i++)
+            sum += sub->buckets_15m[(size_t)(((now / MQTTTOPICS_BUCKET_15M_SECS) - i) % MQTTTOPICS_BUCKETS_15M)];
+        return (double)sum / (double)(slots * MQTTTOPICS_BUCKET_15M_SECS);
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static void __mqtttopics_message_handler(void *user_data, const char *topic, const unsigned char *payload __attribute__((unused)), int payloadlen) {
+    mqtttopics_state_t *state = (mqtttopics_state_t *)user_data;
+    if (!state || !topic)
+        return;
+    const time_t now = time(NULL);
+    const uint32_t hash = __mqtttopics_hash_create(topic);
+    for (int i = 0; i < state->subscription_count; i++) {
+        mqtttopics_sub_t *sub = &state->subscriptions[i];
+        bool match = false;
+        if (mosquitto_topic_matches_sub(sub->topic, topic, &match) == MOSQ_ERR_SUCCESS && match) {
+            sub->messages++;
+            sub->bytes += (uint64_t)(payloadlen > 0 ? payloadlen : 0);
+            sub->last_message_time = now;
+            __mqtttopics_hash_insert(sub, hash);
+            __mqtttopics_bucket_record(sub, now);
+        }
+    }
+}
+
+static void __mqtttopics_connect_handler(void *user_data, bool connected) {
+    mqtttopics_state_t *state = (mqtttopics_state_t *)user_data;
+    if (!state)
+        return;
+    for (int i = 0; i < state->subscription_count; i++)
+        state->subscriptions[i].subscribed = connected && mqtt_subscribe(&state->mqtt_ctx, state->subscriptions[i].topic, 0);
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool mqtttopics_setup(mqtttopics_state_t *state, const char *config_value, const char *client_base) {
+    memset(state, 0, sizeof(*state));
+    if (!config_value || !*config_value)
+        return false;
+    char buf[255]; // XXX
+    size_t cv_len = strlen(config_value);
+    if (cv_len >= sizeof(buf))
+        cv_len = sizeof(buf) - 1;
+    memcpy(buf, config_value, cv_len);
+    buf[cv_len] = '\0';
+    char *server_part = NULL, *topics_part = NULL;
+    char *semi = strchr(buf, ';');
+    if (semi) {
+        *semi = '\0';
+        server_part = buf;
+        topics_part = semi + 1;
+    } else
+        topics_part = buf;
+    if (server_part && *server_part) {
+        const char *src = server_part;
+        if (strncmp(src, "mqtt://", 7) != 0 && strncmp(src, "mqtts://", 8) != 0)
+            snprintf(state->server_buf, sizeof(state->server_buf), "mqtt://%s", src);
+        else
+            snprintf(state->server_buf, sizeof(state->server_buf), "%s", src);
+    } else
+        snprintf(state->server_buf, sizeof(state->server_buf), "%s", MQTTTOPICS_SERVER_DEFAULT);
+    state->mqtt_config.server = state->server_buf;
+    state->mqtt_config.client = snprintf_inline(state->client_id_buf, sizeof(state->client_id_buf), "%s%s", client_base ? client_base : "hostmon", MQTTTOPICS_CLIENT_SUFFIX);
+    state->mqtt_config.use_synchronous = true;
+    state->mqtt_config.tls_insecure = false;
+    state->mqtt_config.reconnect_delay = MQTTTOPICS_RECONNECT_DELAY;
+    state->mqtt_config.reconnect_delay_max = MQTTTOPICS_RECONNECT_DELAY_MAX;
+    snprintf(state->mqtt_ctx.log_prefix, sizeof(state->mqtt_ctx.log_prefix), "check-topics");
+    char *saveptr = NULL, *tok = strtok_r(topics_part, ",", &saveptr);
+    while (tok && state->subscription_count < MQTTTOPICS_MAX_SUBS) {
+        while (*tok == ' ')
+            tok++;
+        char *end = tok + strlen(tok) - 1;
+        while (end > tok && *end == ' ')
+            *end-- = '\0';
+        if (*tok) {
+            mqtttopics_sub_t *sub = &state->subscriptions[state->subscription_count];
+            const size_t tl = strlen(tok);
+            if (tl <= MQTTTOPICS_TOPIC_MAX) {
+                memcpy(sub->topic, tok, tl);
+                sub->topic[tl] = '\0';
+                state->subscription_count++;
+            } else
+                fprintf(stderr, "check-topics: topic too long, skipping: '%s'\n", tok);
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+    if (state->subscription_count == 0) {
+        fprintf(stderr, "check-topics: no topics configured, disabling\n");
+        return false;
+    }
+    state->enabled = true;
+    printf("check-topics: configured (server='%s', client='%s', topics=%d)\n", state->server_buf, state->client_id_buf, state->subscription_count);
+    for (int i = 0; i < state->subscription_count; i++)
+        printf("check-topics:   topic[%d]='%s'\n", i, state->subscriptions[i].topic);
+    return true;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static bool mqtttopics_init(mqtttopics_state_t *state) {
+    if (!state->enabled)
+        return false;
+    mqtt_set_handlers(&state->mqtt_ctx, __mqtttopics_message_handler, __mqtttopics_connect_handler, state);
+    if (!mqtt_begin(&state->mqtt_ctx, &state->mqtt_config)) {
+        fprintf(stderr, "check-topics: connect failed, will retry in background\n");
+        return false;
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static void mqtttopics_loop(mqtttopics_state_t *state, int timeout_ms) {
+    if (!state->enabled)
+        return;
+    mqtt_loop(&state->mqtt_ctx, timeout_ms);
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static void mqtttopics_term(mqtttopics_state_t *state) {
+    if (!state->enabled)
+        return;
+    mqtt_end(&state->mqtt_ctx);
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *mqtttopics_build_json(mqtttopics_state_t *state) {
+    if (!state->enabled)
+        return NULL;
+    cJSON *arr = cJSON_CreateArray();
+    const time_t now = time(NULL);
+    for (int i = 0; i < state->subscription_count; i++) {
+        mqtttopics_sub_t *sub = &state->subscriptions[i];
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(obj, "topic", sub->topic);
+        cJSON_AddBoolToObject(obj, "subscribed", sub->subscribed);
+        cJSON *sizes = cJSON_AddObjectToObject(obj, "sizes");
+        cJSON_AddNumberToObject(sizes, "topics", (double)sub->topic_hash_count);
+        if (sub->topic_hashes_full)
+            cJSON_AddBoolToObject(sizes, "topics_truncated", true);
+        cJSON_AddNumberToObject(sizes, "messages", (double)sub->messages);
+        cJSON_AddNumberToObject(sizes, "bytes", (double)sub->bytes);
+        if (sub->last_message_time > 0)
+            cJSON_AddStringToObject(obj, "last_message_time", strtime_iso8601(sub->last_message_time));
+        cJSON *rates = cJSON_AddObjectToObject(obj, "rates");
+        cJSON *messages = cJSON_AddObjectToObject(rates, "messages");
+        cJSON_AddNumberToObject(messages, "60s", __mqtttopics_rate_window(sub, now, 60));
+        cJSON_AddNumberToObject(messages, "15m", __mqtttopics_rate_window(sub, now, 15 * 60));
+        cJSON_AddNumberToObject(messages, "1h", __mqtttopics_rate_window(sub, now, 60 * 60));
+        cJSON_AddNumberToObject(messages, "3h", __mqtttopics_rate_window(sub, now, 3 * 60 * 60));
+        cJSON_AddNumberToObject(messages, "12h", __mqtttopics_rate_window(sub, now, 12 * 60 * 60));
+        cJSON_AddNumberToObject(messages, "24h", __mqtttopics_rate_window(sub, now, 24 * 60 * 60));
+        cJSON_AddNumberToObject(messages, "72h", __mqtttopics_rate_window(sub, now, 72 * 60 * 60));
+        cJSON_AddItemToArray(arr, obj);
+    }
+    return arr;
+}
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -103,7 +455,8 @@ const struct option config_options[] = {
     {"check-processes",                 required_argument, 0, 0},
     {"check-timesync",                  required_argument, 0, 0},
     {"check-gateway",                   required_argument, 0, 0},
-    {"check-dns",                       required_argument, 0, 0},
+    {"check-resolve",                   required_argument, 0, 0},
+    {"check-topics",                    required_argument, 0, 0},
     {"debug",                           required_argument, 0, 0},
     {0, 0, 0, 0}
 };
@@ -122,7 +475,8 @@ const config_option_help_t config_options_help[] = {
     {"check-processes",                 "Check list of processes (comma-separated) (default: unspecified)"},
     {"check-timesync",                  "Check time synchronisation (default: true)"},
     {"check-gateway",                   "Check ping to network gateway (default: true)"},
-    {"check-dns",                       "Check resolution of specified DNS host (default: unspecified)"},
+    {"check-resolve",                   "Check resolution of specified DNS host (default: unspecified)"},
+    {"check-topics",                    "Check MQTT topics: [server;]topic1,topic2,... (default: unspecified)"},
     {"debug",                           "Enable debug output (true/false)"},
 };
 // clang-format on
@@ -151,6 +505,7 @@ typedef struct {
 typedef struct {
     const char *mqtt_topic_prefix;
     mqtt_config_t mqtt_config;
+    mqtt_context_t mqtt_ctx;
     time_t interval_platform;
     time_t interval_system;
     time_t interval_platform_last;
@@ -162,7 +517,8 @@ typedef struct {
     int processes_count;
     bool check_timesync;
     bool check_gateway;
-    const char *check_dns;
+    const char *check_resolve;
+    mqtttopics_state_t check_topics;
 } hostmon_state_t;
 
 static hostmon_state_t state;
@@ -172,53 +528,11 @@ static time_t last_publish_time = 0;
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static void string_memcpy(char *buf, size_t len, const char *str) {
-    size_t str_len = strlen(str);
-    if (str_len >= len)
-        str_len = len - 1;
-    memcpy(buf, str, str_len);
-    buf[str_len] = '\0';
-}
-
-static const char *string_cleanup(char *str) {
-    size_t str_len = strlen(str);
-    while (str_len > 0 && (str[str_len - 1] == '\n' || str[str_len - 1] == '\r'))
-        str[--str_len] = '\0';
-    return str;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
-static bool read_file_line(const char *path, char *line_buf, size_t line_size) {
-    FILE *f = fopen(path, "r");
-    if (!f)
-        return false;
-    line_buf[0] = '\0';
-    if (fgets(line_buf, (int)line_size, f))
-        string_cleanup(line_buf);
-    fclose(f);
-    return line_buf[0] != '\0';
-}
-
-static bool read_file_uint64(const char *path, uint64_t *val) {
-    char buf[64];
-    if (!read_file_line(path, buf, sizeof(buf)))
-        return false;
-    char *end;
-    *val = strtoull(buf, &end, 10);
-    return *end == '\0' || *end == '\n';
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
 static bool ping_host(const char *host, double *rtt_ms) {
     if (rtt_ms)
         *rtt_ms = -1.0;
     char cmd[160];
-    snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s 2>/dev/null", host);
-    FILE *f = popen(cmd, "r");
+    FILE *f = popen(snprintf_inline(cmd, sizeof(cmd), "ping -c1 -W2 %s 2>/dev/null", host), "r");
     if (!f)
         return false;
     char line[256];
@@ -242,20 +556,9 @@ static bool ping_host(const char *host, double *rtt_ms) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static char *get_timestamp_iso8601(void) {
-    static char buf[32];
-    const time_t now = time(NULL);
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
-    return buf;
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------
-// -----------------------------------------------------------------------------------------------------------------------------------------
-
 static bool get_iface_operstate(const char *name) {
     char path[PATH_MAX], buf[32];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", name);
-    if (!read_file_line(path, buf, sizeof(buf)))
+    if (!read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/operstate", name), buf, sizeof(buf)))
         return false;
     return strcmp(buf, "up") == 0;
 }
@@ -266,12 +569,13 @@ static bool get_iface_ip(const char *name, char *ip_buf, size_t ip_size) {
     if (getifaddrs(&ifas) != 0)
         return false;
     for (ifa = ifas; ifa; ifa = ifa->ifa_next) {
+        // skip non internet
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
             continue;
-        if (strcmp(ifa->ifa_name, name) != 0)
-            continue;
-        inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, ip_buf, (socklen_t)ip_size);
-        break;
+        if (strcmp(ifa->ifa_name, name) == 0) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, ip_buf, (socklen_t)ip_size);
+            break;
+        }
     }
     freeifaddrs(ifas);
     return ip_buf[0] != '\0';
@@ -279,14 +583,12 @@ static bool get_iface_ip(const char *name, char *ip_buf, size_t ip_size) {
 
 static bool get_iface_mac(const char *name, char *mac_buf, size_t mac_size) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/address", name);
-    return read_file_line(path, mac_buf, mac_size);
+    return read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/address", name), mac_buf, mac_size);
 }
 
 static bool get_iface_speed(const char *name, int *speed) {
     char path[PATH_MAX], buf[32];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/speed", name);
-    if (!read_file_line(path, buf, sizeof(buf)))
+    if (!read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/speed", name), buf, sizeof(buf)))
         return false;
     *speed = atoi(buf);
     return *speed > 0;
@@ -294,20 +596,17 @@ static bool get_iface_speed(const char *name, int *speed) {
 
 static bool get_iface_duplex(const char *name, char *buf, size_t size) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/duplex", name);
-    return read_file_line(path, buf, size);
+    return read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/duplex", name), buf, size);
 }
 
 static bool get_iface_counter(const char *name, const char *counter, uint64_t *val) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/%s", name, counter);
-    return read_file_uint64(path, val);
+    return read_file_uint64(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/statistics/%s", name, counter), val);
 }
 
 static bool get_iface_mtu(const char *name, int *mtu) {
     char path[PATH_MAX], buf[32];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/mtu", name);
-    if (!read_file_line(path, buf, sizeof(buf)))
+    if (!read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/mtu", name), buf, sizeof(buf)))
         return false;
     *mtu = atoi(buf);
     return true;
@@ -318,8 +617,7 @@ static bool get_iface_mtu(const char *name, int *mtu) {
 static bool get_wifi_ssid(const char *name, char *ssid_buf, size_t ssid_size) {
     ssid_buf[0] = '\0';
     char cmd[128], buf[256];
-    snprintf(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/ssid/{print $2}'", name);
-    FILE *f = popen(cmd, "r");
+    FILE *f = popen(snprintf_inline(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/ssid/{print $2}'", name), "r");
     if (!f)
         return false;
     if (fgets(buf, (int)sizeof(buf), f))
@@ -356,8 +654,7 @@ static bool get_wifi_signal(const char *name, int *signal_dbm) {
 static bool get_wifi_frequency(const char *name, char *freq_buf, size_t freq_size) {
     freq_buf[0] = '\0';
     char cmd[128], buf[256];
-    snprintf(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/channel/{print $2\"ch \"$5\" MHz\"}'", name);
-    FILE *f = popen(cmd, "r");
+    FILE *f = popen(snprintf_inline(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/channel/{print $2\"ch \"$5\" MHz\"}'", name), "r");
     if (!f)
         return false;
     if (fgets(buf, (int)sizeof(buf), f))
@@ -381,8 +678,7 @@ static int interfaces_discover(void) {
             iface_state_t *iface = &state.interfaces[state.interface_count];
             string_memcpy(iface->name, sizeof(iface->name), ent->d_name);
             char path[PATH_MAX];
-            snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", ent->d_name);
-            iface->is_wifi = (access(path, F_OK) == 0);
+            iface->is_wifi = (access(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/wireless", ent->d_name), F_OK) == 0);
             iface->was_up = false;
             iface->prev_ip[0] = '\0';
             state.interface_count++;
@@ -437,62 +733,63 @@ static cJSON *interfaces_build_json(const iface_state_t *iface) {
     cJSON_AddStringToObject(obj, "name", iface->name);
     cJSON_AddStringToObject(obj, "type", iface->is_wifi ? "wifi" : "ethernet");
 
-    const bool up = get_iface_operstate(iface->name);
-    cJSON_AddBoolToObject(obj, "up", up);
+    int val_int;
+    uint64_t val_uint64;
+    char path[PATH_MAX], val_str[PATH_MAX];
 
-    char ip[INET_ADDRSTRLEN];
-    if (get_iface_ip(iface->name, ip, sizeof(ip)))
-        cJSON_AddStringToObject(obj, "ip", ip);
+    cJSON_AddBoolToObject(obj, "up", get_iface_operstate(iface->name));
 
-    int mtu;
-    if (get_iface_mtu(iface->name, &mtu))
-        cJSON_AddNumberToObject(obj, "mtu", mtu);
+    if (get_iface_ip(iface->name, val_str, sizeof(val_str)))
+        cJSON_AddStringToObject(obj, "ip", val_str);
 
-    char path[PATH_MAX];
-    uint64_t carrier_changes;
-    snprintf(path, sizeof(path), "/sys/class/net/%s/carrier_changes", iface->name);
-    if (read_file_uint64(path, &carrier_changes))
-        cJSON_AddNumberToObject(obj, "carrier_changes", (double)carrier_changes);
+    if (get_iface_mtu(iface->name, &val_int))
+        cJSON_AddNumberToObject(obj, "mtu", val_int);
+
+    if (read_file_uint64(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/carrier_changes", iface->name), &val_uint64))
+        cJSON_AddNumberToObject(obj, "carrier_changes", (double)val_uint64);
 
     if (!iface->is_wifi) {
-        int speed_mbps;
-        if (get_iface_speed(iface->name, &speed_mbps))
-            cJSON_AddNumberToObject(obj, "speed_mbps", speed_mbps);
-        char duplex[16];
-        if (get_iface_duplex(iface->name, duplex, sizeof(duplex)))
-            cJSON_AddStringToObject(obj, "duplex", duplex);
+        if (get_iface_speed(iface->name, &val_int))
+            cJSON_AddNumberToObject(obj, "speed_mbps", val_int);
+        if (get_iface_duplex(iface->name, val_str, sizeof(val_str)))
+            cJSON_AddStringToObject(obj, "duplex", val_str);
     } else {
-        char ssid[64];
-        if (get_wifi_ssid(iface->name, ssid, sizeof(ssid)))
-            cJSON_AddStringToObject(obj, "ssid", ssid);
-        int signal_dbm;
-        if (get_wifi_signal(iface->name, &signal_dbm))
-            cJSON_AddNumberToObject(obj, "signal_dbm", signal_dbm);
-        char frequency[32];
-        if (get_wifi_frequency(iface->name, frequency, sizeof(frequency)))
-            cJSON_AddStringToObject(obj, "frequency", frequency);
+        if (get_wifi_ssid(iface->name, val_str, sizeof(val_str)))
+            cJSON_AddStringToObject(obj, "ssid", val_str);
+        if (get_wifi_signal(iface->name, &val_int))
+            cJSON_AddNumberToObject(obj, "signal_dbm", val_int);
+        if (get_wifi_frequency(iface->name, val_str, sizeof(val_str)))
+            cJSON_AddStringToObject(obj, "frequency", val_str);
     }
 
     // counters
-    uint64_t val;
-    if (get_iface_counter(iface->name, "rx_bytes", &val))
-        cJSON_AddNumberToObject(obj, "rx_bytes", (double)val);
-    if (get_iface_counter(iface->name, "tx_bytes", &val))
-        cJSON_AddNumberToObject(obj, "tx_bytes", (double)val);
-    if (get_iface_counter(iface->name, "rx_packets", &val))
-        cJSON_AddNumberToObject(obj, "rx_packets", (double)val);
-    if (get_iface_counter(iface->name, "tx_packets", &val))
-        cJSON_AddNumberToObject(obj, "tx_packets", (double)val);
-    if (get_iface_counter(iface->name, "rx_errors", &val))
-        cJSON_AddNumberToObject(obj, "rx_errors", (double)val);
-    if (get_iface_counter(iface->name, "tx_errors", &val))
-        cJSON_AddNumberToObject(obj, "tx_errors", (double)val);
-    if (get_iface_counter(iface->name, "rx_dropped", &val))
-        cJSON_AddNumberToObject(obj, "rx_dropped", (double)val);
-    if (get_iface_counter(iface->name, "tx_dropped", &val))
-        cJSON_AddNumberToObject(obj, "tx_dropped", (double)val);
+    if (get_iface_counter(iface->name, "rx_bytes", &val_uint64))
+        cJSON_AddNumberToObject(obj, "rx_bytes", (double)val_uint64);
+    if (get_iface_counter(iface->name, "tx_bytes", &val_uint64))
+        cJSON_AddNumberToObject(obj, "tx_bytes", (double)val_uint64);
+    if (get_iface_counter(iface->name, "rx_packets", &val_uint64))
+        cJSON_AddNumberToObject(obj, "rx_packets", (double)val_uint64);
+    if (get_iface_counter(iface->name, "tx_packets", &val_uint64))
+        cJSON_AddNumberToObject(obj, "tx_packets", (double)val_uint64);
+    if (get_iface_counter(iface->name, "rx_errors", &val_uint64))
+        cJSON_AddNumberToObject(obj, "rx_errors", (double)val_uint64);
+    if (get_iface_counter(iface->name, "tx_errors", &val_uint64))
+        cJSON_AddNumberToObject(obj, "tx_errors", (double)val_uint64);
+    if (get_iface_counter(iface->name, "rx_dropped", &val_uint64))
+        cJSON_AddNumberToObject(obj, "rx_dropped", (double)val_uint64);
+    if (get_iface_counter(iface->name, "tx_dropped", &val_uint64))
+        cJSON_AddNumberToObject(obj, "tx_dropped", (double)val_uint64);
 
     return obj;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *network_build_json(void) {
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < state.interface_count; i++)
+        cJSON_AddItemToArray(arr, interfaces_build_json(&state.interfaces[i]));
+    return arr;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -561,27 +858,24 @@ static bool is_process_running(const char *name, int *pid_out, unsigned long *rs
     while ((ent = readdir(d)) != NULL) {
         if (!isdigit((unsigned char)ent->d_name[0]))
             continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
-        char comm[PROCESS_NAME_MAX];
-        if (!read_file_line(path, comm, sizeof(comm)))
-            continue;
-        if (strcmp(comm, name) == 0) {
-            *pid_out = atoi(ent->d_name);
-            // read RSS from /proc/PID/statm (second field, in pages)
-            snprintf(path, sizeof(path), "/proc/%s/statm", ent->d_name);
-            FILE *f = fopen(path, "r");
-            if (f) {
-                unsigned long size_pages, rss_pages;
-                if (fscanf(f, "%lu %lu", &size_pages, &rss_pages) == 2) {
-                    const long page_size = sysconf(_SC_PAGESIZE);
-                    if (page_size > 0)
-                        *rss_kb_out = rss_pages * (unsigned long)page_size / 1024;
+        char path[PATH_MAX], comm[PROCESS_NAME_MAX];
+        if (read_file_line(snprintf_inline(path, sizeof(path), "/proc/%s/comm", ent->d_name), comm, sizeof(comm))) {
+            if (strcmp(comm, name) == 0) {
+                *pid_out = atoi(ent->d_name);
+                // read RSS from /proc/PID/statm (second field, in pages)
+                FILE *f = fopen(snprintf_inline(path, sizeof(path), "/proc/%s/statm", ent->d_name), "r");
+                if (f) {
+                    unsigned long size_pages, rss_pages;
+                    if (fscanf(f, "%lu %lu", &size_pages, &rss_pages) == 2) {
+                        const long page_size = sysconf(_SC_PAGESIZE);
+                        if (page_size > 0)
+                            *rss_kb_out = rss_pages * (unsigned long)page_size / 1024;
+                    }
+                    fclose(f);
                 }
-                fclose(f);
+                found = true;
+                break;
             }
-            found = true;
-            break;
         }
     }
     closedir(d);
@@ -657,8 +951,7 @@ static cJSON *processes_build_json(void) {
             cJSON_AddNumberToObject(pobj, "rss_kb", (double)rss_kb);
             // uptime of the process
             char path[PATH_MAX], buf[1024];
-            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-            FILE *f = fopen(path, "r");
+            FILE *f = fopen(snprintf_inline(path, sizeof(path), "/proc/%d/stat", pid), "r");
             if (f) {
                 // field 22 is starttime in clock ticks
                 if (fgets(buf, (int)sizeof(buf), f)) {
@@ -686,8 +979,7 @@ static cJSON *processes_build_json(void) {
                 fclose(f);
             }
             // cpu time (utime + stime)
-            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-            f = fopen(path, "r");
+            f = fopen(snprintf_inline(path, sizeof(path), "/proc/%d/stat", pid), "r");
             if (f) {
                 if (fgets(buf, (int)sizeof(buf), f)) {
                     const char *cp = strrchr(buf, ')');
@@ -714,9 +1006,8 @@ static bool get_cpu_temp(double *temp) {
     // try thermal zones
     for (int i = 0; i < 10; i++) {
         char path[PATH_MAX];
-        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
         uint64_t val;
-        if (read_file_uint64(path, &val)) {
+        if (read_file_uint64(snprintf_inline(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i), &val)) {
             *temp = (double)val / 1000.0;
             return true;
         }
@@ -756,6 +1047,25 @@ static bool get_memory_info(uint64_t *total_kb, uint64_t *available_kb, uint64_t
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static cJSON *memory_build_json(void) {
+    uint64_t mem_total_kb, mem_available_kb, mem_free_kb, swap_total_kb, swap_free_kb;
+    if (!get_memory_info(&mem_total_kb, &mem_available_kb, &mem_free_kb, &swap_total_kb, &swap_free_kb))
+        return NULL;
+    cJSON *mem = cJSON_CreateObject();
+    cJSON_AddNumberToObject(mem, "total_kb", (double)mem_total_kb);
+    cJSON_AddNumberToObject(mem, "available_kb", (double)mem_available_kb);
+    cJSON_AddNumberToObject(mem, "free_kb", (double)mem_free_kb);
+    if (mem_total_kb > 0)
+        cJSON_AddNumberToObject(mem, "used_pct", round(1000.0 * (double)(mem_total_kb - mem_available_kb) / (double)mem_total_kb) / 10.0);
+    cJSON_AddNumberToObject(mem, "swap_total_kb", (double)swap_total_kb);
+    cJSON_AddNumberToObject(mem, "swap_free_kb", (double)swap_free_kb);
+    if (swap_total_kb > 0)
+        cJSON_AddNumberToObject(mem, "swap_used_pct", round(1000.0 * (double)(swap_total_kb - swap_free_kb) / (double)swap_total_kb) / 10.0);
+    return mem;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static bool get_cpu_freq(uint64_t *cur_khz, uint64_t *max_khz) {
     *cur_khz = *max_khz = 0;
     read_file_uint64("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", cur_khz);
@@ -773,6 +1083,52 @@ static bool get_cpu_governor(char *buf, size_t size) {
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static cJSON *cpu_build_json(void) {
+    double temp_c;
+    const bool have_temp = get_cpu_temp(&temp_c);
+    uint64_t cpu_cur_khz, cpu_max_khz;
+    const bool have_freq = get_cpu_freq(&cpu_cur_khz, &cpu_max_khz);
+    char governor[32];
+    const bool have_governor = get_cpu_governor(governor, sizeof(governor));
+    uint64_t rpi_flags = 0;
+    const bool have_rpi = get_rpi_throttled(&rpi_flags);
+    if (!have_temp && !have_freq && !have_governor && !have_rpi)
+        return NULL;
+    cJSON *cpu = cJSON_CreateObject();
+    if (have_temp)
+        cJSON_AddNumberToObject(cpu, "temp_c", round(temp_c * 10.0) / 10.0);
+    if (have_freq) {
+        if (cpu_cur_khz > 0)
+            cJSON_AddNumberToObject(cpu, "cur_khz", (double)cpu_cur_khz);
+        if (cpu_max_khz > 0)
+            cJSON_AddNumberToObject(cpu, "max_khz", (double)cpu_max_khz);
+    }
+    if (have_governor)
+        cJSON_AddStringToObject(cpu, "governor", governor);
+    if (have_freq) {
+        bool throttled = false;
+        if (have_rpi && rpi_flags != 0)
+            throttled = (rpi_flags & 0x6) != 0;
+        else if (cpu_cur_khz > 0 && cpu_max_khz > 0 && cpu_cur_khz < cpu_max_khz)
+            throttled = have_governor && strcmp(governor, "performance") == 0;
+        cJSON_AddBoolToObject(cpu, "throttled", throttled);
+    }
+    if (have_rpi) {
+        // bit 0: under-voltage now, 1: freq capped now, 2: throttled now, 3: soft temp limit now
+        // bit 16: under-voltage occurred, 17: freq capped occurred, 18: throttled occurred, 19: soft temp limit occurred
+        cJSON_AddNumberToObject(cpu, "rpi_throttled_flags", (double)rpi_flags);
+        cJSON_AddBoolToObject(cpu, "rpi_undervoltage", (rpi_flags & 0x1) != 0);
+        cJSON_AddBoolToObject(cpu, "rpi_freq_capped", (rpi_flags & 0x2) != 0);
+        cJSON_AddBoolToObject(cpu, "rpi_throttled_now", (rpi_flags & 0x4) != 0);
+        cJSON_AddBoolToObject(cpu, "rpi_soft_temp_limit", (rpi_flags & 0x8) != 0);
+        cJSON_AddBoolToObject(cpu, "rpi_undervoltage_occurred", (rpi_flags & 0x10000) != 0);
+        cJSON_AddBoolToObject(cpu, "rpi_throttled_occurred", (rpi_flags & 0x40000) != 0);
+    }
+    return cpu;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static cJSON *mmc_health_build_json(void) {
     cJSON *arr = NULL;
     DIR *d = opendir("/sys/block");
@@ -786,30 +1142,28 @@ static cJSON *mmc_health_build_json(void) {
         if (strchr(ent->d_name, 'p') != NULL)
             continue;
         char path[PATH_MAX], buf[128];
-        snprintf(path, sizeof(path), "/sys/block/%s/device/life_time", ent->d_name);
-        if (!read_file_line(path, buf, sizeof(buf)))
-            continue;
-        unsigned int type_a = 0, type_b = 0;
-        if (sscanf(buf, "%x %x", &type_a, &type_b) < 1)
-            continue;
-        if (!arr)
-            arr = cJSON_CreateArray();
-        cJSON *dev = cJSON_CreateObject();
-        cJSON_AddStringToObject(dev, "name", ent->d_name);
-        cJSON_AddNumberToObject(dev, "life_time_a", (double)type_a);
-        cJSON_AddNumberToObject(dev, "life_time_b", (double)type_b);
-        // map: 0x01=0-10%, 0x02=10-20%, ... 0x0B=90-100%
-        if (type_a >= 1 && type_a <= 0x0B)
-            cJSON_AddNumberToObject(dev, "used_pct_max_a", (double)(type_a * 10));
-        if (type_b >= 1 && type_b <= 0x0B)
-            cJSON_AddNumberToObject(dev, "used_pct_max_b", (double)(type_b * 10));
-        snprintf(path, sizeof(path), "/sys/block/%s/device/pre_eol_info", ent->d_name);
-        if (read_file_line(path, buf, sizeof(buf))) {
-            unsigned int eol = 0;
-            if (sscanf(buf, "%x", &eol) == 1)
-                cJSON_AddNumberToObject(dev, "pre_eol_info", (double)eol);
+        if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/block/%s/device/life_time", ent->d_name), buf, sizeof(buf))) {
+            unsigned int type_a = 0, type_b = 0;
+            if (sscanf(buf, "%x %x", &type_a, &type_b) >= 1) {
+                if (!arr)
+                    arr = cJSON_CreateArray();
+                cJSON *dev = cJSON_CreateObject();
+                cJSON_AddStringToObject(dev, "name", ent->d_name);
+                cJSON_AddNumberToObject(dev, "life_time_a", (double)type_a);
+                cJSON_AddNumberToObject(dev, "life_time_b", (double)type_b);
+                // map: 0x01=0-10%, 0x02=10-20%, ... 0x0B=90-100%
+                if (type_a >= 1 && type_a <= 0x0B)
+                    cJSON_AddNumberToObject(dev, "used_pct_max_a", (double)(type_a * 10));
+                if (type_b >= 1 && type_b <= 0x0B)
+                    cJSON_AddNumberToObject(dev, "used_pct_max_b", (double)(type_b * 10));
+                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/block/%s/device/pre_eol_info", ent->d_name), buf, sizeof(buf))) {
+                    unsigned int eol = 0;
+                    if (sscanf(buf, "%x", &eol) == 1)
+                        cJSON_AddNumberToObject(dev, "pre_eol_info", (double)eol);
+                }
+                cJSON_AddItemToArray(arr, dev);
+            }
         }
-        cJSON_AddItemToArray(arr, dev);
     }
     closedir(d);
     return arr;
@@ -822,6 +1176,17 @@ static bool get_load_averages(double *load1, double *load5, double *load15) {
     const bool ok = (fscanf(f, "%lf %lf %lf", load1, load5, load15) == 3);
     fclose(f);
     return ok;
+}
+
+static cJSON *load_build_json(void) {
+    double load_1min, load_5min, load_15min;
+    if (!get_load_averages(&load_1min, &load_5min, &load_15min))
+        return NULL;
+    cJSON *load = cJSON_CreateObject();
+    cJSON_AddNumberToObject(load, "1min", load_1min);
+    cJSON_AddNumberToObject(load, "5min", load_5min);
+    cJSON_AddNumberToObject(load, "15min", load_15min);
+    return load;
 }
 
 static bool get_disk_usage(const char *path, uint64_t *total_mb, uint64_t *used_mb, uint64_t *avail_mb) {
@@ -845,16 +1210,30 @@ static bool is_filesystem_readonly(const char *mountpoint) {
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *disk_build_json(void) {
+    uint64_t disk_total_mb, disk_used_mb, disk_avail_mb;
+    if (!get_disk_usage("/", &disk_total_mb, &disk_used_mb, &disk_avail_mb))
+        return NULL;
+    cJSON *disk = cJSON_CreateObject();
+    cJSON_AddNumberToObject(disk, "total_mb", (double)disk_total_mb);
+    cJSON_AddNumberToObject(disk, "used_mb", (double)disk_used_mb);
+    cJSON_AddNumberToObject(disk, "avail_mb", (double)disk_avail_mb);
+    if (disk_total_mb > 0)
+        cJSON_AddNumberToObject(disk, "used_pct", round(1000.0 * (double)disk_used_mb / (double)disk_total_mb) / 10.0);
+    cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
+    return disk;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool check_dns_resolution(const char *hostname, char *result_ip, size_t result_size) {
+static bool check_resolve_dns_name(const char *hostname, char *result_ip, size_t result_size) {
     result_ip[0] = '\0';
     if (!hostname || !*hostname)
         return false;
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+    const struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
     if (getaddrinfo(hostname, NULL, &hints, &res) != 0)
         return false;
     if (res && res->ai_addr)
@@ -864,11 +1243,24 @@ static bool check_dns_resolution(const char *hostname, char *result_ip, size_t r
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *resolve_build_json(void) {
+    cJSON *resolve = cJSON_CreateObject();
+    cJSON_AddStringToObject(resolve, "hostname", state.check_resolve);
+    char resolved_ip[INET_ADDRSTRLEN];
+    const bool resolved = check_resolve_dns_name(state.check_resolve, resolved_ip, sizeof(resolved_ip));
+    cJSON_AddBoolToObject(resolve, "ok", resolved);
+    if (resolved)
+        cJSON_AddStringToObject(resolve, "ip", resolved_ip);
+    return resolve;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool get_default_gateway(char *gw_buf, size_t gw_size, char *iface_buf, size_t iface_size) {
+static bool get_default_gateway(char *gw_buf, size_t gw_size, char *iface_buf, size_t iface_len) {
     gw_buf[0] = '\0';
-    if (iface_buf && iface_size > 0)
+    if (iface_buf && iface_len > 0)
         iface_buf[0] = '\0';
     FILE *f = fopen("/proc/net/route", "r");
     if (!f)
@@ -885,13 +1277,34 @@ static bool get_default_gateway(char *gw_buf, size_t gw_size, char *iface_buf, s
             if (dest == 0 && gateway != 0) {
                 const struct in_addr addr = { .s_addr = (in_addr_t)gateway };
                 inet_ntop(AF_INET, &addr, gw_buf, (socklen_t)gw_size);
-                if (iface_buf && iface_size > 0)
-                    string_memcpy(iface_buf, iface_size, iface);
+                if (iface_buf && iface_len > 0)
+                    string_memcpy(iface_buf, iface_len, iface);
                 break;
             }
     }
     fclose(f);
     return gw_buf[0] != '\0';
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static cJSON *gateway_build_json(void) {
+    cJSON *gateway = cJSON_CreateObject();
+    char gw_ip[INET_ADDRSTRLEN], gw_if[INTERFACE_NAME_MAX];
+    if (get_default_gateway(gw_ip, sizeof(gw_ip), gw_if, sizeof(gw_if))) {
+        cJSON_AddStringToObject(gateway, "ip", gw_ip);
+        if (gw_if[0])
+            cJSON_AddStringToObject(gateway, "interface", gw_if);
+        double rtt_ms = -1.0;
+        const bool reachable = ping_host(gw_ip, &rtt_ms);
+        cJSON_AddBoolToObject(gateway, "reachable", reachable);
+        if (reachable && rtt_ms >= 0.0)
+            cJSON_AddNumberToObject(gateway, "rtt_ms", round(rtt_ms * 100.0) / 100.0);
+    } else {
+        cJSON_AddStringToObject(gateway, "ip", "none");
+        cJSON_AddBoolToObject(gateway, "reachable", false);
+    }
+    return gateway;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -903,6 +1316,7 @@ static cJSON *usbdevs_build_json(void) {
     if (d) {
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
+            // skip ourselves
             if (ent->d_name[0] == '.')
                 continue;
             // skip interface entries (contain ':')
@@ -912,25 +1326,20 @@ static cJSON *usbdevs_build_json(void) {
             if (strncmp(ent->d_name, "usb", 3) == 0)
                 continue;
             char path[PATH_MAX], buf[128];
-            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", ent->d_name);
-            if (!read_file_line(path, buf, sizeof(buf)))
-                continue;
-            cJSON *dev = cJSON_CreateObject();
-            cJSON_AddStringToObject(dev, "bus_id", ent->d_name);
-            cJSON_AddStringToObject(dev, "vendor_id", buf);
-            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/idProduct", ent->d_name);
-            if (read_file_line(path, buf, sizeof(buf)))
-                cJSON_AddStringToObject(dev, "product_id", buf);
-            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/manufacturer", ent->d_name);
-            if (read_file_line(path, buf, sizeof(buf)))
-                cJSON_AddStringToObject(dev, "manufacturer", buf);
-            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name);
-            if (read_file_line(path, buf, sizeof(buf)))
-                cJSON_AddStringToObject(dev, "product", buf);
-            snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/serial", ent->d_name);
-            if (read_file_line(path, buf, sizeof(buf)))
-                cJSON_AddStringToObject(dev, "serial", buf);
-            cJSON_AddItemToArray(arr, dev);
+            if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", ent->d_name), buf, sizeof(buf))) {
+                cJSON *dev = cJSON_CreateObject();
+                cJSON_AddStringToObject(dev, "bus_id", ent->d_name);
+                cJSON_AddStringToObject(dev, "vendor_id", buf);
+                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/idProduct", ent->d_name), buf, sizeof(buf)))
+                    cJSON_AddStringToObject(dev, "product_id", buf);
+                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/manufacturer", ent->d_name), buf, sizeof(buf)))
+                    cJSON_AddStringToObject(dev, "manufacturer", buf);
+                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name), buf, sizeof(buf)))
+                    cJSON_AddStringToObject(dev, "product", buf);
+                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/serial", ent->d_name), buf, sizeof(buf)))
+                    cJSON_AddStringToObject(dev, "serial", buf);
+                cJSON_AddItemToArray(arr, dev);
+            }
         }
         closedir(d);
     }
@@ -940,172 +1349,91 @@ static cJSON *usbdevs_build_json(void) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static cJSON *mqtt_build_json(void) {
+    cJSON *mqtt = cJSON_CreateObject();
+    cJSON_AddBoolToObject(mqtt, "connected", mqtt_is_connected(&state.mqtt_ctx));
+    cJSON_AddNumberToObject(mqtt, "connects", (double)state.mqtt_ctx.stat_connects);
+    cJSON_AddNumberToObject(mqtt, "disconnects", (double)state.mqtt_ctx.stat_disconnects);
+    cJSON_AddNumberToObject(mqtt, "reconnects", (double)state.mqtt_ctx.stat_reconnects);
+    cJSON_AddNumberToObject(mqtt, "publishes", (double)state.mqtt_ctx.stat_publishes);
+    cJSON_AddNumberToObject(mqtt, "publish_bytes", (double)state.mqtt_ctx.stat_publish_bytes);
+    cJSON_AddNumberToObject(mqtt, "publish_errors", (double)state.mqtt_ctx.stat_publish_errors);
+    if (state.mqtt_ctx.stat_last_connect_time > 0)
+        cJSON_AddStringToObject(mqtt, "last_connect_time", strtime_iso8601(state.mqtt_ctx.stat_last_connect_time));
+    if (last_publish_time > 0)
+        cJSON_AddStringToObject(mqtt, "last_publish_time", strtime_iso8601(last_publish_time));
+    return mqtt;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static cJSON *build_system_json(void) {
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "timestamp", get_timestamp_iso8601());
+    cJSON_AddStringToObject(root, "timestamp", strtime_iso8601(time(NULL)));
     cJSON_AddStringToObject(root, "type", "system");
+
+    cJSON *sub;
 
     // show uptime
     struct sysinfo si;
     if (sysinfo(&si) == 0) {
-        cJSON_AddNumberToObject(root, "uptime_secs", (double)si.uptime);
         char uptime[64];
-        snprintf(uptime, sizeof(uptime), "%dd %dh %dm", (int)(si.uptime / 86400), (int)((si.uptime % 86400) / 3600), (int)((si.uptime % 3600) / 60));
-        cJSON_AddStringToObject(root, "uptime", uptime);
+        cJSON_AddNumberToObject(root, "uptime_secs", (double)si.uptime);
+        cJSON_AddStringToObject(root, "uptime", snprintf_inline(uptime, sizeof(uptime), "%dd %dh %dm", (int)(si.uptime / 86400), (int)((si.uptime % 86400) / 3600), (int)((si.uptime % 3600) / 60)));
     }
-
-    // show temp
-    double cpu_temp_c;
-    if (get_cpu_temp(&cpu_temp_c))
-        cJSON_AddNumberToObject(root, "cpu_temp_c", round(cpu_temp_c * 10.0) / 10.0);
 
     // show load
-    double load_1min, load_5min, load_15min;
-    if (get_load_averages(&load_1min, &load_5min, &load_15min)) {
-        cJSON *load = cJSON_AddObjectToObject(root, "load");
-        cJSON_AddNumberToObject(load, "1min", load_1min);
-        cJSON_AddNumberToObject(load, "5min", load_5min);
-        cJSON_AddNumberToObject(load, "15min", load_15min);
-    }
+    if ((sub = load_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "load", sub);
 
     // show memory
-    uint64_t mem_total_kb, mem_available_kb, mem_free_kb, swap_total_kb, swap_free_kb;
-    if (get_memory_info(&mem_total_kb, &mem_available_kb, &mem_free_kb, &swap_total_kb, &swap_free_kb)) {
-        cJSON *mem = cJSON_AddObjectToObject(root, "memory");
-        cJSON_AddNumberToObject(mem, "total_kb", (double)mem_total_kb);
-        cJSON_AddNumberToObject(mem, "available_kb", (double)mem_available_kb);
-        cJSON_AddNumberToObject(mem, "free_kb", (double)mem_free_kb);
-        if (mem_total_kb > 0)
-            cJSON_AddNumberToObject(mem, "used_pct", round(1000.0 * (double)(mem_total_kb - mem_available_kb) / (double)mem_total_kb) / 10.0);
-        cJSON_AddNumberToObject(mem, "swap_total_kb", (double)swap_total_kb);
-        cJSON_AddNumberToObject(mem, "swap_free_kb", (double)swap_free_kb);
-        if (swap_total_kb > 0)
-            cJSON_AddNumberToObject(mem, "swap_used_pct", round(1000.0 * (double)(swap_total_kb - swap_free_kb) / (double)swap_total_kb) / 10.0);
-    }
+    if ((sub = memory_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "memory", sub);
 
-    // show cpu frequency / throttling
-    uint64_t cpu_cur_khz, cpu_max_khz;
-    if (get_cpu_freq(&cpu_cur_khz, &cpu_max_khz)) {
-        cJSON *cpu = cJSON_AddObjectToObject(root, "cpu");
-        if (cpu_cur_khz > 0)
-            cJSON_AddNumberToObject(cpu, "cur_khz", (double)cpu_cur_khz);
-        if (cpu_max_khz > 0)
-            cJSON_AddNumberToObject(cpu, "max_khz", (double)cpu_max_khz);
-        char governor[32];
-        const bool have_governor = get_cpu_governor(governor, sizeof(governor));
-        if (have_governor)
-            cJSON_AddStringToObject(cpu, "governor", governor);
-        uint64_t rpi_flags = 0;
-        const bool have_rpi = get_rpi_throttled(&rpi_flags);
-        bool throttled = false;
-        if (have_rpi && rpi_flags != 0)
-            throttled = (rpi_flags & 0x6) != 0;
-        else if (cpu_cur_khz > 0 && cpu_max_khz > 0 && cpu_cur_khz < cpu_max_khz)
-            throttled = have_governor && strcmp(governor, "performance") == 0;
-        cJSON_AddBoolToObject(cpu, "throttled", throttled);
-        if (have_rpi) {
-            // bit 0: under-voltage now, 1: freq capped now, 2: throttled now, 3: soft temp limit now
-            // bit 16: under-voltage occurred, 17: freq capped occurred, 18: throttled occurred, 19: soft temp limit occurred
-            cJSON_AddNumberToObject(cpu, "rpi_throttled_flags", (double)rpi_flags);
-            cJSON_AddBoolToObject(cpu, "rpi_undervoltage", (rpi_flags & 0x1) != 0);
-            cJSON_AddBoolToObject(cpu, "rpi_freq_capped", (rpi_flags & 0x2) != 0);
-            cJSON_AddBoolToObject(cpu, "rpi_throttled_now", (rpi_flags & 0x4) != 0);
-            cJSON_AddBoolToObject(cpu, "rpi_soft_temp_limit", (rpi_flags & 0x8) != 0);
-            cJSON_AddBoolToObject(cpu, "rpi_undervoltage_occurred", (rpi_flags & 0x10000) != 0);
-            cJSON_AddBoolToObject(cpu, "rpi_throttled_occurred", (rpi_flags & 0x40000) != 0);
-        }
-    }
+    // show cpu temperature / frequency / throttling
+    if ((sub = cpu_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "cpu", sub);
 
     // show network interfaces
-    cJSON *interfaces = cJSON_AddArrayToObject(root, "network");
-    for (int i = 0; i < state.interface_count; i++)
-        cJSON_AddItemToArray(interfaces, interfaces_build_json(&state.interfaces[i]));
+    if ((sub = network_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "network", sub);
 
     // show mqtt connection status
-    cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
-    cJSON_AddBoolToObject(mqtt, "connected", mqtt_is_connected());
-    cJSON_AddNumberToObject(mqtt, "connects", (double)mqtt_stat_connects);
-    cJSON_AddNumberToObject(mqtt, "disconnects", (double)mqtt_stat_disconnects);
-    cJSON_AddNumberToObject(mqtt, "reconnects", (double)mqtt_stat_reconnects);
-    cJSON_AddNumberToObject(mqtt, "publishes", (double)mqtt_stat_publishes);
-    cJSON_AddNumberToObject(mqtt, "publish_bytes", (double)mqtt_stat_publish_bytes);
-    cJSON_AddNumberToObject(mqtt, "publish_errors", (double)mqtt_stat_publish_errors);
-    if (mqtt_stat_last_connect_time > 0) {
-        char ts[32];
-        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&mqtt_stat_last_connect_time));
-        cJSON_AddStringToObject(mqtt, "last_connect_time", ts);
-    }
-    if (last_publish_time > 0) {
-        char ts[32];
-        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&last_publish_time));
-        cJSON_AddStringToObject(mqtt, "last_publish_time", ts);
-    }
+    if ((sub = mqtt_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "mqtt", sub);
 
     // show disk usage (root filesystem)
-    uint64_t disk_total_mb, disk_used_mb, disk_avail_mb;
-    if (get_disk_usage("/", &disk_total_mb, &disk_used_mb, &disk_avail_mb)) {
-        cJSON *disk = cJSON_AddObjectToObject(root, "disk");
-        cJSON_AddNumberToObject(disk, "total_mb", (double)disk_total_mb);
-        cJSON_AddNumberToObject(disk, "used_mb", (double)disk_used_mb);
-        cJSON_AddNumberToObject(disk, "avail_mb", (double)disk_avail_mb);
-        if (disk_total_mb > 0)
-            cJSON_AddNumberToObject(disk, "used_pct", round(1000.0 * (double)disk_used_mb / (double)disk_total_mb) / 10.0);
-        cJSON_AddBoolToObject(disk, "readonly", is_filesystem_readonly("/"));
-    }
+    if ((sub = disk_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "disk", sub);
 
     // show eMMC/SD health
-    cJSON *mmc = mmc_health_build_json();
-    if (mmc)
-        cJSON_AddItemToObject(root, "mmc", mmc);
+    if ((sub = mmc_health_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "mmc", sub);
 
     // show USB devices
-    cJSON *usb = usbdevs_build_json();
-    if (usb)
-        cJSON_AddItemToObject(root, "usb", usb);
+    if ((sub = usbdevs_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "usb", sub);
 
     // check processes
-    if (state.processes_count > 0) {
-        cJSON *processes = processes_build_json();
-        if (processes)
-            cJSON_AddItemToObject(root, "processes", processes);
-    }
+    if (state.processes_count > 0 && (sub = processes_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "processes", sub);
 
     // check time synchronisation
-    if (state.check_timesync) {
-        cJSON *timesync = timesync_build_json();
-        if (timesync)
-            cJSON_AddItemToObject(root, "timesync", timesync);
-    }
+    if (state.check_timesync && (sub = timesync_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "timesync", sub);
 
     // check gateway reachability
-    if (state.check_gateway) {
-        cJSON *gateway = cJSON_AddObjectToObject(root, "gateway");
-        char gw_ip[INET_ADDRSTRLEN], gw_iface[INTERFACE_NAME_MAX];
-        if (get_default_gateway(gw_ip, sizeof(gw_ip), gw_iface, sizeof(gw_iface))) {
-            cJSON_AddStringToObject(gateway, "ip", gw_ip);
-            if (gw_iface[0])
-                cJSON_AddStringToObject(gateway, "interface", gw_iface);
-            double rtt_ms = -1.0;
-            const bool reachable = ping_host(gw_ip, &rtt_ms);
-            cJSON_AddBoolToObject(gateway, "reachable", reachable);
-            if (reachable && rtt_ms >= 0.0)
-                cJSON_AddNumberToObject(gateway, "rtt_ms", round(rtt_ms * 100.0) / 100.0);
-        } else {
-            cJSON_AddStringToObject(gateway, "ip", "none");
-            cJSON_AddBoolToObject(gateway, "reachable", false);
-        }
-    }
+    if (state.check_gateway && (sub = gateway_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "gateway", sub);
 
-    // check DNS resolution
-    if (state.check_dns && *state.check_dns) {
-        cJSON *dns = cJSON_AddObjectToObject(root, "dns");
-        cJSON_AddStringToObject(dns, "check_host", state.check_dns);
-        char resolved_ip[INET_ADDRSTRLEN];
-        const bool resolved = check_dns_resolution(state.check_dns, resolved_ip, sizeof(resolved_ip));
-        cJSON_AddBoolToObject(dns, "ok", resolved);
-        if (resolved)
-            cJSON_AddStringToObject(dns, "resolved_ip", resolved_ip);
-    }
+    // check DNS resolver
+    if (state.check_resolve && *state.check_resolve && (sub = resolve_build_json()) != NULL)
+        cJSON_AddItemToObject(root, "resolve", sub);
+
+    // check topics liveness
+    if (state.check_topics.enabled && (sub = mqtttopics_build_json(&state.check_topics)) != NULL)
+        cJSON_AddItemToObject(root, "topics", sub);
 
     return root;
 }
@@ -1119,7 +1447,7 @@ static cJSON *build_platform_json(void) {
         return NULL;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "timestamp", get_timestamp_iso8601());
+    cJSON_AddStringToObject(root, "timestamp", strtime_iso8601(time(NULL)));
     cJSON_AddStringToObject(root, "type", "platform");
     cJSON_AddStringToObject(root, "hostmon_version", HOSTMON_VERSION);
 
@@ -1137,8 +1465,9 @@ static cJSON *build_platform_json(void) {
     if (f) {
         char line[256];
         while (fgets(line, (int)sizeof(line), f))
-            if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
-                char *val = line + 12;
+#define _STR_PRETTY_NAME "PRETTY_NAME="
+            if (strncmp(line, _STR_PRETTY_NAME, sizeof(_STR_PRETTY_NAME) - 1) == 0) {
+                char *val = line + (sizeof(_STR_PRETTY_NAME) - 1);
                 size_t len = strlen(val);
                 while (len > 0 && (val[len - 1] == '\n' || val[len - 1] == '"'))
                     val[--len] = '\0';
@@ -1152,12 +1481,8 @@ static cJSON *build_platform_json(void) {
 
     // boot time
     struct sysinfo si;
-    if (sysinfo(&si) == 0) {
-        char boot_time[32];
-        const time_t boot_timet = time(NULL) - si.uptime;
-        strftime(boot_time, sizeof(boot_time), "%Y-%m-%dT%H:%M:%SZ", gmtime(&boot_timet));
-        cJSON_AddStringToObject(root, "boot_time", boot_time);
-    }
+    if (sysinfo(&si) == 0)
+        cJSON_AddStringToObject(root, "boot_time", strtime_iso8601(time(NULL) - si.uptime));
 
     // list discovered interfaces
     cJSON *interfaces = cJSON_AddArrayToObject(root, "interfaces");
@@ -1178,7 +1503,7 @@ static cJSON *build_platform_json(void) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static bool publish_json(const char *subtopic, cJSON *json) {
-    if (!json || !mqtt_is_connected())
+    if (!json || !mqtt_is_connected(&state.mqtt_ctx))
         return false;
     char *str = cJSON_PrintUnformatted(json);
     if (!str) {
@@ -1188,8 +1513,7 @@ static bool publish_json(const char *subtopic, cJSON *json) {
     char topic[TOPIC_MAX], hostname[64];
     if (gethostname(hostname, sizeof(hostname)) != 0)
         snprintf(hostname, sizeof(hostname), "unknown");
-    snprintf(topic, sizeof(topic), "%s/%s/%s", state.mqtt_topic_prefix, hostname, subtopic);
-    const bool ok = mqtt_send(topic, str, (int)strlen(str));
+    const bool ok = mqtt_send(&state.mqtt_ctx, snprintf_inline(topic, sizeof(topic), "%s/%s/%s", state.mqtt_topic_prefix, hostname, subtopic), str, (int)strlen(str));
     if (ok)
         last_publish_time = time(NULL);
     if (state.debug)
@@ -1221,10 +1545,11 @@ static time_t intervalable(const time_t interval, time_t *last, bool forced) {
 static void hostmon_run(void) {
 
     printf("hostmon: running (platform=%lds, system=%lds, interfaces=%d, procs=%d, dns=%s, topic=%s)\n", (long)state.interval_platform, (long)state.interval_system, state.interface_count, state.processes_count,
-           state.check_dns ? state.check_dns : "none", state.mqtt_topic_prefix);
+           state.check_resolve ? state.check_resolve : "none", state.mqtt_topic_prefix);
 
     processes_init();
     interfaces_init();
+    mqtttopics_init(&state.check_topics);
 
     publish_json("platform", build_platform_json());
     state.interval_platform_last = time(NULL);
@@ -1250,10 +1575,13 @@ static void hostmon_run(void) {
             publish_json("system", build_system_json());
 
         if (state.mqtt_config.use_synchronous)
-            mqtt_loop(1000);
+            mqtt_loop(&state.mqtt_ctx, 1000);
         else
             usleep(1000000); /* 1 second */
+        mqtttopics_loop(&state.check_topics, 50);
     }
+
+    mqtttopics_term(&state.check_topics);
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -1283,18 +1611,23 @@ static bool config_setup(const int argc, char *argv[]) {
         return false;
 
     memset(&state, 0, sizeof(state));
+    snprintf(state.mqtt_ctx.log_prefix, sizeof(state.mqtt_ctx.log_prefix), "mqtt");
+    mqtt_config_populate(&state.mqtt_config);
     state.mqtt_topic_prefix = config_get_string("mqtt-topic-prefix", MQTT_TOPIC_PREFIX_DEFAULT);
     state.interval_platform = (time_t)config_get_integer("interval-platform", INTERVAL_PLATFORM_DEFAULT);
     state.interval_system = (time_t)config_get_integer("interval-system", INTERVAL_SYSTEM_DEFAULT);
     const char *processes_csv = config_get_string("check-processes", NULL);
     if (processes_csv)
         processes_parse(processes_csv);
+    if (!interfaces_discover())
+        printf("hostmon: WARNING no network interfaces discovered\n");
     state.check_timesync = config_get_bool("check-timesync", true);
     state.check_gateway = config_get_bool("check-gateway", true);
-    state.check_dns = config_get_string("check-dns", NULL);
+    state.check_resolve = config_get_string("check-resolve", NULL);
+    const char *check_topics = config_get_string("check-topics", NULL);
+    if (check_topics && *check_topics)
+        mqtttopics_setup(&state.check_topics, check_topics, state.mqtt_config.client);
     state.debug = config_get_bool("debug", false);
-
-    mqtt_config_populate(&state.mqtt_config);
 
     return true;
 }
@@ -1319,15 +1652,12 @@ int main(int argc, char *argv[]) {
     if (!config_setup(argc, argv))
         return EXIT_FAILURE;
 
-    if (!interfaces_discover())
-        printf("hostmon: WARNING no network interfaces discovered\n");
-
-    if (!mqtt_begin(&state.mqtt_config))
+    if (!mqtt_begin(&state.mqtt_ctx, &state.mqtt_config))
         return EXIT_FAILURE;
 
     hostmon_run();
 
-    mqtt_end();
+    mqtt_end(&state.mqtt_ctx);
 
     return EXIT_SUCCESS;
 }
