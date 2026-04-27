@@ -89,7 +89,7 @@ static const char *string_cleanup(char *str) {
     return str;
 }
 
-static bool read_file_line(const char *path, char *line_buf, size_t line_size) {
+static bool read_file_string(const char *path, char *line_buf, size_t line_size) {
     FILE *f = fopen(path, "r");
     if (!f)
         return false;
@@ -102,11 +102,22 @@ static bool read_file_line(const char *path, char *line_buf, size_t line_size) {
 
 static bool read_file_uint64(const char *path, uint64_t *val) {
     char buf[64];
-    if (!read_file_line(path, buf, sizeof(buf)))
+    if (!read_file_string(path, buf, sizeof(buf)))
         return false;
     char *end;
     *val = strtoull(buf, &end, 10);
     return *end == '\0' || *end == '\n';
+}
+
+static bool read_pipe_string(const char *cmd, char *line_buf, size_t line_size) {
+    FILE *f = popen(cmd, "r");
+    if (!f)
+        return false;
+    line_buf[0] = '\0';
+    if (fgets(line_buf, (int)line_size, f))
+        string_cleanup(line_buf);
+    pclose(f);
+    return line_buf[0] != '\0';
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -558,7 +569,7 @@ static bool ping_host(const char *host, double *rtt_ms) {
 
 static bool get_iface_operstate(const char *name) {
     char path[PATH_MAX], buf[32];
-    if (!read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/operstate", name), buf, sizeof(buf)))
+    if (!read_file_string(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/operstate", name), buf, sizeof(buf)))
         return false;
     return strcmp(buf, "up") == 0;
 }
@@ -583,20 +594,24 @@ static bool get_iface_ip(const char *name, char *ip_buf, size_t ip_size) {
 
 static bool get_iface_mac(const char *name, char *mac_buf, size_t mac_size) {
     char path[PATH_MAX];
-    return read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/address", name), mac_buf, mac_size);
+    if (!read_file_string(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/address", name), mac_buf, mac_size))
+        return false;
+    return mac_buf[0] != '\0';
 }
 
 static bool get_iface_speed(const char *name, int *speed) {
     char path[PATH_MAX], buf[32];
-    if (!read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/speed", name), buf, sizeof(buf)))
+    if (!read_file_string(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/speed", name), buf, sizeof(buf)))
         return false;
     *speed = atoi(buf);
     return *speed > 0;
 }
 
-static bool get_iface_duplex(const char *name, char *buf, size_t size) {
+static bool get_iface_duplex(const char *name, char *duplex_buf, size_t duplex_size) {
     char path[PATH_MAX];
-    return read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/duplex", name), buf, size);
+    if (!read_file_string(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/duplex", name), duplex_buf, duplex_size))
+        return false;
+    return duplex_buf[0] != '\0';
 }
 
 static bool get_iface_counter(const char *name, const char *counter, uint64_t *val) {
@@ -606,7 +621,7 @@ static bool get_iface_counter(const char *name, const char *counter, uint64_t *v
 
 static bool get_iface_mtu(const char *name, int *mtu) {
     char path[PATH_MAX], buf[32];
-    if (!read_file_line(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/mtu", name), buf, sizeof(buf)))
+    if (!read_file_string(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/mtu", name), buf, sizeof(buf)))
         return false;
     *mtu = atoi(buf);
     return true;
@@ -615,14 +630,9 @@ static bool get_iface_mtu(const char *name, int *mtu) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static bool get_wifi_ssid(const char *name, char *ssid_buf, size_t ssid_size) {
-    ssid_buf[0] = '\0';
-    char cmd[128], buf[256];
-    FILE *f = popen(snprintf_inline(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/ssid/{print $2}'", name), "r");
-    if (!f)
+    char cmd[128];
+    if (!read_pipe_string(snprintf_inline(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/ssid/{print $2}'", name), ssid_buf, ssid_size))
         return false;
-    if (fgets(buf, (int)sizeof(buf), f))
-        snprintf(ssid_buf, ssid_size, "%s", string_cleanup(buf));
-    pclose(f);
     return ssid_buf[0] != '\0';
 }
 
@@ -652,14 +662,9 @@ static bool get_wifi_signal(const char *name, int *signal_dbm) {
 }
 
 static bool get_wifi_frequency(const char *name, char *freq_buf, size_t freq_size) {
-    freq_buf[0] = '\0';
-    char cmd[128], buf[256];
-    FILE *f = popen(snprintf_inline(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/channel/{print $2\"ch \"$5\" MHz\"}'", name), "r");
-    if (!f)
+    char cmd[128];
+    if (!read_pipe_string(snprintf_inline(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null | awk '/channel/{print $2\"ch \"$5\" MHz\"}'", name), freq_buf, freq_size))
         return false;
-    if (fgets(buf, (int)sizeof(buf), f))
-        snprintf(freq_buf, freq_size, "%s", string_cleanup(buf));
-    pclose(f);
     return freq_buf[0] != '\0';
 }
 
@@ -762,7 +767,6 @@ static cJSON *interfaces_build_json(const iface_state_t *iface) {
             cJSON_AddStringToObject(obj, "frequency", val_str);
     }
 
-    // counters
     if (get_iface_counter(iface->name, "rx_bytes", &val_uint64))
         cJSON_AddNumberToObject(obj, "rx_bytes", (double)val_uint64);
     if (get_iface_counter(iface->name, "tx_bytes", &val_uint64))
@@ -799,16 +803,12 @@ static cJSON *timesync_build_json(void) {
     cJSON *timesync = cJSON_CreateObject();
 
     // try timedatectl (systemd-timesyncd)
-    FILE *f = popen("timedatectl show --property=NTPSynchronized --value 2>/dev/null", "r");
-    if (f) {
-        char buf[32];
-        if (fgets(buf, (int)sizeof(buf), f))
-            cJSON_AddBoolToObject(timesync, "synchronized", strcmp(string_cleanup(buf), "yes") == 0);
-        pclose(f);
-    }
+    char buf[32];
+    if (read_pipe_string("timedatectl show --property=NTPSynchronized --value 2>/dev/null", buf, sizeof(buf)))
+        cJSON_AddBoolToObject(timesync, "synchronized", strcmp(buf, "yes") == 0);
 
     // try chronyc for offset
-    f = popen("chronyc tracking 2>/dev/null", "r");
+    FILE *f = popen("chronyc tracking 2>/dev/null", "r");
     if (f) {
         char line[256];
         bool found_source = false;
@@ -848,8 +848,6 @@ static cJSON *timesync_build_json(void) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static bool is_process_running(const char *name, int *pid_out, unsigned long *rss_kb_out) {
-    *pid_out = 0;
-    *rss_kb_out = 0;
     DIR *d = opendir("/proc");
     if (!d)
         return false;
@@ -859,8 +857,9 @@ static bool is_process_running(const char *name, int *pid_out, unsigned long *rs
         if (!isdigit((unsigned char)ent->d_name[0]))
             continue;
         char path[PATH_MAX], comm[PROCESS_NAME_MAX];
-        if (read_file_line(snprintf_inline(path, sizeof(path), "/proc/%s/comm", ent->d_name), comm, sizeof(comm))) {
+        if (read_file_string(snprintf_inline(path, sizeof(path), "/proc/%s/comm", ent->d_name), comm, sizeof(comm))) {
             if (strcmp(comm, name) == 0) {
+                *rss_kb_out = 0;
                 *pid_out = atoi(ent->d_name);
                 // read RSS from /proc/PID/statm (second field, in pages)
                 FILE *f = fopen(snprintf_inline(path, sizeof(path), "/proc/%s/statm", ent->d_name), "r");
@@ -951,47 +950,39 @@ static cJSON *processes_build_json(void) {
             cJSON_AddNumberToObject(pobj, "rss_kb", (double)rss_kb);
             // uptime of the process
             char path[PATH_MAX], buf[1024];
-            FILE *f = fopen(snprintf_inline(path, sizeof(path), "/proc/%d/stat", pid), "r");
-            if (f) {
+            if (read_file_string(snprintf_inline(path, sizeof(path), "/proc/%d/stat", pid), buf, sizeof(buf))) {
                 // field 22 is starttime in clock ticks
-                if (fgets(buf, (int)sizeof(buf), f)) {
-                    // skip past the comm field (which may contain spaces/parens)
-                    const char *cp = strrchr(buf, ')');
-                    if (cp) {
-                        unsigned long long starttime = 0;
-                        // fields after ')' are: state, ppid, pgrp, session, tty_nr, tpgid,
-                        //   flags, minflt, cminflt, majflt, cmajflt, utime, stime, cutime,
-                        //   cstime, priority, nice, num_threads, itrealvalue, starttime
-                        const int n = sscanf(cp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &starttime);
-                        if (n == 1) {
-                            const long hz = sysconf(_SC_CLK_TCK);
-                            if (hz > 0) {
-                                struct sysinfo si;
-                                if (sysinfo(&si) == 0) {
-                                    const long proc_uptime = si.uptime - (long)(starttime / (unsigned long long)hz);
-                                    if (proc_uptime >= 0)
-                                        cJSON_AddNumberToObject(pobj, "uptime_secs", (double)proc_uptime);
-                                }
+                // skip past the comm field (which may contain spaces/parens)
+                const char *cp = strrchr(buf, ')');
+                if (cp) {
+                    unsigned long long starttime = 0;
+                    // fields after ')' are: state, ppid, pgrp, session, tty_nr, tpgid,
+                    //   flags, minflt, cminflt, majflt, cmajflt, utime, stime, cutime,
+                    //   cstime, priority, nice, num_threads, itrealvalue, starttime
+                    const int n = sscanf(cp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &starttime);
+                    if (n == 1) {
+                        const long hz = sysconf(_SC_CLK_TCK);
+                        if (hz > 0) {
+                            struct sysinfo si;
+                            if (sysinfo(&si) == 0) {
+                                const long proc_uptime = si.uptime - (long)(starttime / (unsigned long long)hz);
+                                if (proc_uptime >= 0)
+                                    cJSON_AddNumberToObject(pobj, "uptime_secs", (double)proc_uptime);
                             }
                         }
                     }
                 }
-                fclose(f);
             }
             // cpu time (utime + stime)
-            f = fopen(snprintf_inline(path, sizeof(path), "/proc/%d/stat", pid), "r");
-            if (f) {
-                if (fgets(buf, (int)sizeof(buf), f)) {
-                    const char *cp = strrchr(buf, ')');
-                    if (cp) {
-                        unsigned long utime = 0, stime = 0;
-                        sscanf(cp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &utime, &stime);
-                        const long hz = sysconf(_SC_CLK_TCK);
-                        if (hz > 0)
-                            cJSON_AddNumberToObject(pobj, "cpu_secs", (double)(utime + stime) / (double)hz);
-                    }
+            if (read_file_string(snprintf_inline(path, sizeof(path), "/proc/%d/stat", pid), buf, sizeof(buf))) {
+                const char *cp = strrchr(buf, ')');
+                if (cp) {
+                    unsigned long utime = 0, stime = 0;
+                    sscanf(cp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &utime, &stime);
+                    const long hz = sysconf(_SC_CLK_TCK);
+                    if (hz > 0)
+                        cJSON_AddNumberToObject(pobj, "cpu_secs", (double)(utime + stime) / (double)hz);
                 }
-                fclose(f);
             }
         }
         cJSON_AddItemToArray(arr, pobj);
@@ -1078,7 +1069,7 @@ static bool get_rpi_throttled(uint64_t *flags) {
 }
 
 static bool get_cpu_governor(char *buf, size_t size) {
-    return read_file_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", buf, size);
+    return read_file_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", buf, size);
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -1142,7 +1133,7 @@ static cJSON *mmc_health_build_json(void) {
         if (strchr(ent->d_name, 'p') != NULL)
             continue;
         char path[PATH_MAX], buf[128];
-        if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/block/%s/device/life_time", ent->d_name), buf, sizeof(buf))) {
+        if (read_file_string(snprintf_inline(path, sizeof(path), "/sys/block/%s/device/life_time", ent->d_name), buf, sizeof(buf))) {
             unsigned int type_a = 0, type_b = 0;
             if (sscanf(buf, "%x %x", &type_a, &type_b) >= 1) {
                 if (!arr)
@@ -1156,7 +1147,7 @@ static cJSON *mmc_health_build_json(void) {
                     cJSON_AddNumberToObject(dev, "used_pct_max_a", (double)(type_a * 10));
                 if (type_b >= 1 && type_b <= 0x0B)
                     cJSON_AddNumberToObject(dev, "used_pct_max_b", (double)(type_b * 10));
-                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/block/%s/device/pre_eol_info", ent->d_name), buf, sizeof(buf))) {
+                if (read_file_string(snprintf_inline(path, sizeof(path), "/sys/block/%s/device/pre_eol_info", ent->d_name), buf, sizeof(buf))) {
                     unsigned int eol = 0;
                     if (sscanf(buf, "%x", &eol) == 1)
                         cJSON_AddNumberToObject(dev, "pre_eol_info", (double)eol);
@@ -1326,17 +1317,17 @@ static cJSON *usbdevs_build_json(void) {
             if (strncmp(ent->d_name, "usb", 3) == 0)
                 continue;
             char path[PATH_MAX], buf[128];
-            if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", ent->d_name), buf, sizeof(buf))) {
+            if (read_file_string(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/idVendor", ent->d_name), buf, sizeof(buf))) {
                 cJSON *dev = cJSON_CreateObject();
                 cJSON_AddStringToObject(dev, "bus_id", ent->d_name);
                 cJSON_AddStringToObject(dev, "vendor_id", buf);
-                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/idProduct", ent->d_name), buf, sizeof(buf)))
+                if (read_file_string(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/idProduct", ent->d_name), buf, sizeof(buf)))
                     cJSON_AddStringToObject(dev, "product_id", buf);
-                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/manufacturer", ent->d_name), buf, sizeof(buf)))
+                if (read_file_string(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/manufacturer", ent->d_name), buf, sizeof(buf)))
                     cJSON_AddStringToObject(dev, "manufacturer", buf);
-                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name), buf, sizeof(buf)))
+                if (read_file_string(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/product", ent->d_name), buf, sizeof(buf)))
                     cJSON_AddStringToObject(dev, "product", buf);
-                if (read_file_line(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/serial", ent->d_name), buf, sizeof(buf)))
+                if (read_file_string(snprintf_inline(path, sizeof(path), "/sys/bus/usb/devices/%s/serial", ent->d_name), buf, sizeof(buf)))
                     cJSON_AddStringToObject(dev, "serial", buf);
                 cJSON_AddItemToArray(arr, dev);
             }
@@ -1459,7 +1450,7 @@ static cJSON *build_platform_json(void) {
 
     // os-release
     char buf[256];
-    if (read_file_line("/etc/hostname", buf, sizeof(buf)))
+    if (read_file_string("/etc/hostname", buf, sizeof(buf)))
         cJSON_AddStringToObject(root, "hostname_file", buf);
     FILE *f = fopen("/etc/os-release", "r");
     if (f) {
