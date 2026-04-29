@@ -44,11 +44,31 @@ $(TARGET): $(MAIN) $(SOURCES)
 	$(CC) $(CFLAGS) -o $(TARGET) $(MAIN) $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(TARGET).armhf
 format:
 	clang-format -i $(MAIN) $(SOURCES)
 
-.PHONY: all clean format
+DEV_PACKAGES=libcjson-dev libmosquitto-dev
+DEV_PACKAGES_ARMHF=$(addsuffix :armhf,$(DEV_PACKAGES))
+install-dev:
+	apt install -y $(DEV_PACKAGES)
+remove-dev:
+	apt purge -y $(DEV_PACKAGES)
+install-dev-armhf:
+	dpkg --add-architecture armhf
+	apt update
+	apt install -y gcc-arm-linux-gnueabihf $(DEV_PACKAGES_ARMHF)
+remove-dev-armhf:
+	apt purge -y gcc-arm-linux-gnueabihf $(DEV_PACKAGES_ARMHF)
+	dpkg --remove-architecture armhf
+	apt update
+
+CROSS_CC_ARMHF=arm-linux-gnueabihf-gcc
+$(TARGET).armhf: $(MAIN) $(SOURCES)
+	$(CROSS_CC_ARMHF) $(CFLAGS) -o $(TARGET).armhf $(MAIN) $(LDFLAGS) $(LIBS)
+armhf: $(TARGET).armhf
+
+.PHONY: all clean format install-dev remove-dev install-dev-armhf remove-dev-armhf armhf
 
 ##
 
