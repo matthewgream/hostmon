@@ -77,7 +77,7 @@ DIR_INSTALL=/usr/local/bin
 DIR_DEFAULT=/etc/default
 DIR_SYSTEMD=/etc/systemd/system
 HOSTNAME:=$(shell hostname)
-CFG_SRC:=$(if $(wildcard $(TARGET).$(HOSTNAME).cfg),$(TARGET).$(HOSTNAME).cfg,$(TARGET).cfg)
+CFG_SRC:=$(if $(wildcard $(TARGET).cfg.$(HOSTNAME)),$(TARGET).cfg.$(HOSTNAME),$(TARGET).cfg)
 define install_service_systemd
 	-systemctl stop $(2) 2>/dev/null || true
 	-systemctl disable $(2) 2>/dev/null || true
