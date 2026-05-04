@@ -231,7 +231,7 @@ function showSystemSummary(hosts) {
         const cpu = s.cpu || {};
         const disk = s.disk || {};
         const gw = s.gateway || {};
-        const dns = s.dns || {};
+        const resolve = s.resolve || {};
         const mq = s.mqtt || {};
         const ts = s.timesync || {};
 
@@ -247,7 +247,7 @@ function showSystemSummary(hosts) {
         const swapStr = mem.swap_total_kb > 0 ? fmtPct(mem.swap_used_pct) : '-';
         const diskStr = `${fmtPct(disk.used_pct)} ${disk.total_mb ? Math.round(disk.total_mb / 1024) + 'G' : ''}`;
         const loadStr = s.load ? s.load['1min'].toFixed(2) : '-';
-        const cpuStr = cpu.throttled ? `${C.yellow}${fmtTemp(s.cpu_temp_c)}!${C.reset}` : fmtTemp(s.cpu_temp_c);
+        const cpuStr = cpu.throttled ? `${C.yellow}${fmtTemp(s.cpu.temp_c)}!${C.reset}` : fmtTemp(s.cpu.temp_c);
         const gwStr = gw.reachable != null ? (gw.reachable ? `${gw.rtt_ms != null ? gw.rtt_ms.toFixed(0) + 'ms' : 'ok'}` : `${C.red}DOWN${C.reset}`) : '-';
 
         console.log(
@@ -263,7 +263,7 @@ function showSystemSummary(hosts) {
                 pad(indicator(mq.connected), cols[8][1]),
                 pad(indicator(ts.synchronized), cols[9][1]),
                 pad(gwStr, cols[10][1]),
-                pad(dns.ok != null ? indicator(dns.ok) : '-', cols[11][1]),
+                pad(resolve.ok != null ? indicator(resolve.ok) : '-', cols[11][1]),
             ].join('  ')
         );
     }
@@ -276,7 +276,7 @@ function showSystemDetailed(hosts) {
         const cpu = s.cpu || {};
         const disk = s.disk || {};
         const gw = s.gateway || {};
-        const dns = s.dns || {};
+        const resolve = s.resolve || {};
         const mq = s.mqtt || {};
         const ts = s.timesync || {};
 
@@ -285,7 +285,7 @@ function showSystemDetailed(hosts) {
         console.log(`  Uptime:       ${s.uptime || '-'} (${s.uptime_secs || 0}s)`);
 
         // CPU
-        console.log(`  CPU temp:     ${fmtTemp(s.cpu_temp_c)}`);
+        console.log(`  CPU temp:     ${fmtTemp(s.cpu.temp_c)}`);
         if (cpu.cur_khz != null)
             console.log(
                 `  CPU freq:     ${fmtFreq(cpu.cur_khz)} / ${fmtFreq(cpu.max_khz)} (${cpu.governor || '?'})${cpu.throttled ? ` ${C.yellow}THROTTLED${C.reset}` : ''}`
@@ -339,7 +339,7 @@ function showSystemDetailed(hosts) {
         );
 
         // DNS
-        if (dns.check_host) console.log(`  DNS:          ${indicator(dns.ok)} ${dns.check_host} -> ${dns.resolved_ip || 'FAILED'}`);
+        if (resolve.hostname) console.log(`  Resolve:      ${indicator(resolve.ok)} ${resolve.hostname} -> ${resolve.ip || 'FAILED'}`);
 
         // USB
         if (s.usb && s.usb.length > 0) {
