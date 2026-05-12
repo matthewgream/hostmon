@@ -28,6 +28,8 @@ CFLAGS_OPT=#-O3
 CFLAGS=$(CFLAGS_COMMON) $(CFLAGS_OPT)
 LDFLAGS=
 LIBS=-lcjson -lmosquitto -lm
+HOSTNAME:=$(shell hostname)
+CFG_SRC:=$(if $(wildcard $(TARGET).cfg.$(HOSTNAME)),$(TARGET).cfg.$(HOSTNAME),$(TARGET).cfg)
 
 ##
 
@@ -47,6 +49,8 @@ clean:
 	rm -f $(TARGET) $(TARGET).armhf
 format:
 	clang-format -i $(MAIN) $(SOURCES)
+test: $(TARGET)
+	./$(TARGET) --config $(CFG_SRC)
 
 DEV_PACKAGES=libcjson-dev libmosquitto-dev
 DEV_PACKAGES_ARMHF=$(addsuffix :armhf,$(DEV_PACKAGES))
@@ -76,8 +80,6 @@ INSTALL=hostmon
 DIR_INSTALL=/usr/local/bin
 DIR_DEFAULT=/etc/default
 DIR_SYSTEMD=/etc/systemd/system
-HOSTNAME:=$(shell hostname)
-CFG_SRC:=$(if $(wildcard $(TARGET).cfg.$(HOSTNAME)),$(TARGET).cfg.$(HOSTNAME),$(TARGET).cfg)
 define install_service_systemd
 	-systemctl stop $(2) 2>/dev/null || true
 	-systemctl disable $(2) 2>/dev/null || true
