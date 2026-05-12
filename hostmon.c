@@ -1493,7 +1493,7 @@ static cJSON *build_platform_json(void) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static bool publish_json(const char *subtopic, cJSON *json) {
+static bool publish_json(const char *type, cJSON *json) {
     if (!json || !mqtt_is_connected(&state.mqtt_ctx))
         return false;
     char *str = cJSON_PrintUnformatted(json);
@@ -1504,11 +1504,11 @@ static bool publish_json(const char *subtopic, cJSON *json) {
     char topic[TOPIC_MAX], hostname[64];
     if (gethostname(hostname, sizeof(hostname)) != 0)
         snprintf(hostname, sizeof(hostname), "unknown");
-    const bool ok = mqtt_send(&state.mqtt_ctx, snprintf_inline(topic, sizeof(topic), "%s/%s/%s", state.mqtt_topic_prefix, hostname, subtopic), str, (int)strlen(str));
+    const bool ok = mqtt_send(&state.mqtt_ctx, snprintf_inline(topic, sizeof(topic), "%s/%s", state.mqtt_topic_prefix, hostname), str, (int)strlen(str));
     if (ok)
         last_publish_time = time(NULL);
     if (state.debug)
-        printf("hostmon: publish %s (%d bytes) -> %s\n", subtopic, (int)strlen(str), ok ? "ok" : "FAILED");
+        printf("hostmon: publish %s (%d bytes) -> %s\n", type, (int)strlen(str), ok ? "ok" : "FAILED");
     free(str);
     cJSON_Delete(json);
     return ok;

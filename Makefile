@@ -28,8 +28,6 @@ CFLAGS_OPT=#-O3
 CFLAGS=$(CFLAGS_COMMON) $(CFLAGS_OPT)
 LDFLAGS=
 LIBS=-lcjson -lmosquitto -lm
-HOSTNAME:=$(shell hostname)
-CFG_SRC:=$(if $(wildcard $(TARGET).cfg.$(HOSTNAME)),$(TARGET).cfg.$(HOSTNAME),$(TARGET).cfg)
 
 ##
 
@@ -37,6 +35,8 @@ TARGET=hostmon
 MAIN=hostmon.c
 SOURCES=\
     config_linux.h mqtt_linux.h
+HOSTNAME:=$(shell hostname)
+CFG_SRC:=$(if $(wildcard $(TARGET).$(HOSTNAME).cfg),$(TARGET).$(HOSTNAME).cfg,$(TARGET).cfg)
 
 ##
 
