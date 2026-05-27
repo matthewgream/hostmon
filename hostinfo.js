@@ -198,6 +198,21 @@ function showPlatformDetailed(hosts) {
             console.log(`  Interfaces:`);
             for (const i of p.interfaces) console.log(`    ${i.name}: type=${i.type}, mac=${i.mac || '?'}`);
         }
+        if (p.root) console.log(`  Root:         ${p.root.name}${p.root.uuid ? ` (uuid=${p.root.uuid})` : ''}${p.root.fstype ? ` [${p.root.fstype}]` : ''}`);
+        if (p.boot) console.log(`  Boot:         ${p.boot.name}${p.boot.uuid ? ` (uuid=${p.boot.uuid})` : ''}${p.boot.fstype ? ` [${p.boot.fstype}]` : ''}${p.boot.mountpoint ? ` @ ${p.boot.mountpoint}` : ''}`);
+        if (p.partitions && p.partitions.length > 0) {
+            console.log(`  Partitions:`);
+            for (const part of p.partitions) {
+                const size = part.size_mb >= 1024 ? (part.size_mb / 1024).toFixed(1) + 'G' : part.size_mb + 'M';
+                let line = `    ${part.name} (${size})`;
+                if (part.mountpoint) line += ` @ ${part.mountpoint}${part.fstype ? ' [' + part.fstype + ']' : ''}${part.readonly ? ` ${C.red}ro${C.reset}` : ''}`;
+                if (part.label) line += `, label=${part.label}`;
+                if (part.uuid) line += `, uuid=${part.uuid}`;
+                if (part.partlabel) line += `, partlabel=${part.partlabel}`;
+                if (part.partuuid) line += `, partuuid=${part.partuuid}`;
+                console.log(line);
+            }
+        }
         console.log('');
     }
 }

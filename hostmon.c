@@ -32,7 +32,9 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <stddef.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -1120,6 +1122,216 @@ static cJSON *cpu_build_json(void) {
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+#define PARTITIONS_MAX 64
+
+typedef struct {
+    char name[64];
+    int major, minor;
+    uint64_t size_kb; // /proc/partitions reports 1024-byte blocks
+    char uuid[64];
+    char label[96];
+    char partuuid[64];
+    char partlabel[128];
+    char mountpoint[256];
+    char fstype[32];
+    bool mounted;
+    bool readonly;
+} partition_t;
+
+static bool partition_name_is_excluded(const char *name) {
+    return strncmp(name, "loop", 4) == 0 || strncmp(name, "ram", 3) == 0 || strncmp(name, "zram", 4) == 0 || strncmp(name, "fd", 2) == 0;
+}
+
+// /proc/partitions header is "major minor #blocks name"; #blocks is in 1024-byte units.
+static int partitions_scan_proc(partition_t *parts, int max) {
+    FILE *f = fopen("/proc/partitions", "r");
+    if (!f)
+        return 0;
+    char line[256];
+    int n = 0;
+    (void)fgets(line, sizeof(line), f); // header
+    (void)fgets(line, sizeof(line), f); // blank
+    while (n < max && fgets(line, sizeof(line), f)) {
+        int maj, min;
+        uint64_t blocks;
+        char name[64];
+        if (sscanf(line, "%d %d %" SCNu64 " %63s", &maj, &min, &blocks, name) != 4)
+            continue;
+        if (partition_name_is_excluded(name))
+            continue;
+        partition_t *p = &parts[n++];
+        memset(p, 0, sizeof(*p));
+        string_memcpy(p->name, sizeof(p->name), name);
+        p->major = maj;
+        p->minor = min;
+        p->size_kb = blocks;
+    }
+    fclose(f);
+    return n;
+}
+
+// /dev/disk/by-* entries are symlinks back to ../../<devname>. Map link name -> field.
+static void partitions_scan_dev_disk(const char *dir, partition_t *parts, int n, size_t field_off, size_t field_size) {
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.')
+            continue;
+        char path[PATH_MAX], target[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        ssize_t len = readlink(path, target, sizeof(target) - 1);
+        if (len <= 0)
+            continue;
+        target[len] = '\0';
+        const char *base = strrchr(target, '/');
+        base = base ? base + 1 : target;
+        for (int i = 0; i < n; i++)
+            if (strcmp(parts[i].name, base) == 0) {
+                char *field = (char *)&parts[i] + field_off;
+                string_memcpy(field, field_size, ent->d_name);
+                break;
+            }
+    }
+    closedir(d);
+}
+
+// mountinfo and udev symlink names use \\OOO octal escapes for spaces and other chars
+static void partition_unescape(char *s) {
+    char *r = s, *w = s;
+    while (*r) {
+        if (r[0] == '\\' && r[1] >= '0' && r[1] <= '3' && r[2] >= '0' && r[2] <= '7' && r[3] >= '0' && r[3] <= '7') {
+            *w++ = (char)(((r[1] - '0') << 6) | ((r[2] - '0') << 3) | (r[3] - '0'));
+            r += 4;
+        } else
+            *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+static bool partition_options_has(const char *opts, const char *opt) {
+    size_t opt_len = strlen(opt);
+    const char *p = opts;
+    while ((p = strstr(p, opt)) != NULL) {
+        if ((p == opts || *(p - 1) == ',') && (p[opt_len] == ',' || p[opt_len] == '\0'))
+            return true;
+        p += opt_len;
+    }
+    return false;
+}
+
+static void partitions_scan_mountinfo(partition_t *parts, int n) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    if (!f)
+        return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *sep = strstr(line, " - ");
+        if (!sep)
+            continue;
+        int mnt_id, parent_id, maj, min;
+        char root[256], mountpoint[256], options[256];
+        if (sscanf(line, "%d %d %d:%d %255s %255s %255s", &mnt_id, &parent_id, &maj, &min, root, mountpoint, options) < 7)
+            continue;
+        char fstype[32];
+        if (sscanf(sep + 3, "%31s", fstype) < 1)
+            continue;
+        for (int i = 0; i < n; i++)
+            if (parts[i].major == maj && parts[i].minor == min && !parts[i].mounted) {
+                parts[i].mounted = true;
+                partition_unescape(mountpoint);
+                string_memcpy(parts[i].mountpoint, sizeof(parts[i].mountpoint), mountpoint);
+                string_memcpy(parts[i].fstype, sizeof(parts[i].fstype), fstype);
+                parts[i].readonly = partition_options_has(options, "ro");
+                break;
+            }
+    }
+    fclose(f);
+}
+
+static const partition_t *partition_find_mounted_at(const partition_t *parts, int n, const char *mp) {
+    for (int i = 0; i < n; i++)
+        if (parts[i].mounted && strcmp(parts[i].mountpoint, mp) == 0)
+            return &parts[i];
+    return NULL;
+}
+
+static cJSON *partition_ref_json(const partition_t *p) {
+    if (!p)
+        return NULL;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "name", p->name);
+    if (p->uuid[0])
+        cJSON_AddStringToObject(o, "uuid", p->uuid);
+    if (p->label[0])
+        cJSON_AddStringToObject(o, "label", p->label);
+    if (p->fstype[0])
+        cJSON_AddStringToObject(o, "fstype", p->fstype);
+    if (p->mounted)
+        cJSON_AddStringToObject(o, "mountpoint", p->mountpoint);
+    return o;
+}
+
+static void partitions_add_to_json(cJSON *root) {
+    partition_t parts[PARTITIONS_MAX];
+    int n = partitions_scan_proc(parts, PARTITIONS_MAX);
+    if (n <= 0)
+        return;
+    partitions_scan_dev_disk("/dev/disk/by-uuid", parts, n, offsetof(partition_t, uuid), sizeof(parts[0].uuid));
+    partitions_scan_dev_disk("/dev/disk/by-label", parts, n, offsetof(partition_t, label), sizeof(parts[0].label));
+    partitions_scan_dev_disk("/dev/disk/by-partuuid", parts, n, offsetof(partition_t, partuuid), sizeof(parts[0].partuuid));
+    partitions_scan_dev_disk("/dev/disk/by-partlabel", parts, n, offsetof(partition_t, partlabel), sizeof(parts[0].partlabel));
+    for (int i = 0; i < n; i++) {
+        partition_unescape(parts[i].label);
+        partition_unescape(parts[i].partlabel);
+    }
+    partitions_scan_mountinfo(parts, n);
+
+    cJSON *arr = cJSON_AddArrayToObject(root, "partitions");
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "name", parts[i].name);
+        cJSON_AddNumberToObject(o, "major", (double)parts[i].major);
+        cJSON_AddNumberToObject(o, "minor", (double)parts[i].minor);
+        cJSON_AddNumberToObject(o, "size_mb", (double)(parts[i].size_kb / 1024));
+        if (parts[i].uuid[0])
+            cJSON_AddStringToObject(o, "uuid", parts[i].uuid);
+        if (parts[i].label[0])
+            cJSON_AddStringToObject(o, "label", parts[i].label);
+        if (parts[i].partuuid[0])
+            cJSON_AddStringToObject(o, "partuuid", parts[i].partuuid);
+        if (parts[i].partlabel[0])
+            cJSON_AddStringToObject(o, "partlabel", parts[i].partlabel);
+        if (parts[i].mounted) {
+            cJSON_AddStringToObject(o, "mountpoint", parts[i].mountpoint);
+            cJSON_AddStringToObject(o, "fstype", parts[i].fstype);
+            cJSON_AddBoolToObject(o, "readonly", parts[i].readonly);
+        }
+        cJSON_AddItemToArray(arr, o);
+    }
+
+    const partition_t *root_part = partition_find_mounted_at(parts, n, "/");
+    cJSON *r = partition_ref_json(root_part);
+    if (r)
+        cJSON_AddItemToObject(root, "root", r);
+
+    // boot: prefer /boot, then RPi /boot/firmware, then UEFI /boot/efi. /boot only counts if
+    // it's a distinct partition from /; otherwise it's just a directory inside root.
+    const partition_t *boot_part = partition_find_mounted_at(parts, n, "/boot");
+    if (boot_part && root_part && boot_part->major == root_part->major && boot_part->minor == root_part->minor)
+        boot_part = NULL;
+    if (!boot_part)
+        boot_part = partition_find_mounted_at(parts, n, "/boot/firmware");
+    if (!boot_part)
+        boot_part = partition_find_mounted_at(parts, n, "/boot/efi");
+    cJSON *b = partition_ref_json(boot_part);
+    if (b)
+        cJSON_AddItemToObject(root, "boot", b);
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static cJSON *mmc_health_build_json(void) {
     cJSON *arr = NULL;
     DIR *d = opendir("/sys/block");
@@ -1486,6 +1698,9 @@ static cJSON *build_platform_json(void) {
             cJSON_AddStringToObject(interface, "mac", mac);
         cJSON_AddItemToArray(interfaces, interface);
     }
+
+    // block devices / partitions (UUIDs, labels, sizes — rarely change), plus root/boot refs
+    partitions_add_to_json(root);
 
     return root;
 }
