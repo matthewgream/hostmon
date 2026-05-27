@@ -569,6 +569,34 @@ static bool ping_host(const char *host, double *rtt_ms) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static bool get_os_pretty(char *buf, size_t size) {
+    FILE *f = fopen("/etc/os-release", "r");
+    if (!f)
+        return false;
+    char line[256];
+    bool found = false;
+    while (fgets(line, (int)sizeof(line), f)) {
+#define _STR_PRETTY_NAME "PRETTY_NAME="
+        if (strncmp(line, _STR_PRETTY_NAME, sizeof(_STR_PRETTY_NAME) - 1) != 0)
+            continue;
+        char *val = line + (sizeof(_STR_PRETTY_NAME) - 1);
+        size_t len = strlen(val);
+        while (len > 0 && (val[len - 1] == '\n' || val[len - 1] == '"'))
+            val[--len] = '\0';
+        if (*val == '"')
+            val++;
+        string_memcpy(buf, size, val);
+        found = true;
+        break;
+#undef _STR_PRETTY_NAME
+    }
+    fclose(f);
+    return found;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static bool get_iface_operstate(const char *name) {
     char path[PATH_MAX], buf[32];
     if (!read_file_string(snprintf_inline(path, sizeof(path), "/sys/class/net/%s/operstate", name), buf, sizeof(buf)))
@@ -627,6 +655,19 @@ static bool get_iface_mtu(const char *name, int *mtu) {
         return false;
     *mtu = atoi(buf);
     return true;
+}
+
+static void interfaces_add_to_json(cJSON *root) {
+    cJSON *interfaces = cJSON_AddArrayToObject(root, "interfaces");
+    for (int i = 0; i < state.interface_count; i++) {
+        cJSON *interface = cJSON_CreateObject();
+        cJSON_AddStringToObject(interface, "name", state.interfaces[i].name);
+        cJSON_AddStringToObject(interface, "type", state.interfaces[i].is_wifi ? "wifi" : "ethernet");
+        char mac[24];
+        if (get_iface_mac(state.interfaces[i].name, mac, sizeof(mac)))
+            cJSON_AddStringToObject(interface, "mac", mac);
+        cJSON_AddItemToArray(interfaces, interface);
+    }
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -1645,62 +1686,39 @@ static cJSON *build_system_json(void) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static cJSON *build_platform_json(void) {
-    struct utsname uts;
-    if (uname(&uts) != 0)
-        return NULL;
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "timestamp", strtime_iso8601(time(NULL)));
     cJSON_AddStringToObject(root, "type", "platform");
     cJSON_AddStringToObject(root, "hostmon_version", HOSTMON_VERSION);
 
-    cJSON_AddStringToObject(root, "hostname", uts.nodename);
-    cJSON_AddStringToObject(root, "kernel", uts.release);
-    cJSON_AddStringToObject(root, "kernel_version", uts.version);
-    cJSON_AddStringToObject(root, "arch", uts.machine);
-    cJSON_AddStringToObject(root, "os", uts.sysname);
+    // kernel
+    struct utsname uts;
+    if (uname(&uts) == 0) {
+        cJSON_AddStringToObject(root, "hostname", uts.nodename);
+        cJSON_AddStringToObject(root, "kernel", uts.release);
+        cJSON_AddStringToObject(root, "kernel_version", uts.version);
+        cJSON_AddStringToObject(root, "arch", uts.machine);
+        cJSON_AddStringToObject(root, "os", uts.sysname);
+    }
 
-    // os-release
+    // userland
     char buf[256];
     if (read_file_string("/etc/hostname", buf, sizeof(buf)))
         cJSON_AddStringToObject(root, "hostname_file", buf);
-    FILE *f = fopen("/etc/os-release", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, (int)sizeof(line), f))
-#define _STR_PRETTY_NAME "PRETTY_NAME="
-            if (strncmp(line, _STR_PRETTY_NAME, sizeof(_STR_PRETTY_NAME) - 1) == 0) {
-                char *val = line + (sizeof(_STR_PRETTY_NAME) - 1);
-                size_t len = strlen(val);
-                while (len > 0 && (val[len - 1] == '\n' || val[len - 1] == '"'))
-                    val[--len] = '\0';
-                if (*val == '"')
-                    val++;
-                cJSON_AddStringToObject(root, "os_pretty", val);
-                break;
-            }
-        fclose(f);
-    }
+    if (get_os_pretty(buf, sizeof(buf)))
+        cJSON_AddStringToObject(root, "os_pretty", buf);
 
     // boot time
     struct sysinfo si;
     if (sysinfo(&si) == 0)
         cJSON_AddStringToObject(root, "boot_time", strtime_iso8601(time(NULL) - si.uptime));
 
-    // list discovered interfaces
-    cJSON *interfaces = cJSON_AddArrayToObject(root, "interfaces");
-    for (int i = 0; i < state.interface_count; i++) {
-        cJSON *interface = cJSON_CreateObject();
-        cJSON_AddStringToObject(interface, "name", state.interfaces[i].name);
-        cJSON_AddStringToObject(interface, "type", state.interfaces[i].is_wifi ? "wifi" : "ethernet");
-        char mac[24];
-        if (get_iface_mac(state.interfaces[i].name, mac, sizeof(mac)))
-            cJSON_AddStringToObject(interface, "mac", mac);
-        cJSON_AddItemToArray(interfaces, interface);
-    }
-
-    // block devices / partitions (UUIDs, labels, sizes — rarely change), plus root/boot refs
+    // partitions and mountpoints
     partitions_add_to_json(root);
+
+    // interfaces
+    interfaces_add_to_json(root);
 
     return root;
 }
