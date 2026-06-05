@@ -1108,7 +1108,16 @@ static bool get_cpu_freq(uint64_t *cur_khz, uint64_t *max_khz) {
 }
 
 static bool get_rpi_throttled(uint64_t *flags) {
-    return read_file_uint64("/sys/devices/platform/soc/soc:firmware/get_throttled", flags);
+    char buf[64];
+    if (!read_pipe_string("vcgencmd get_throttled 2>/dev/null", buf, sizeof(buf)))
+        return false;
+    // output is "throttled=0x0"
+    const char *eq = strchr(buf, '=');
+    if (!eq)
+        return false;
+    char *end;
+    *flags = strtoull(eq + 1, &end, 0); // base 0 handles the 0x prefix
+    return end != eq + 1;
 }
 
 static bool get_cpu_governor(char *buf, size_t size) {
