@@ -460,6 +460,7 @@ const struct option config_options[] = {
     {"mqtt-client",                     required_argument, 0, 0},
     {"mqtt-server",                     required_argument, 0, 0},
     {"mqtt-topic-prefix",               required_argument, 0, 0},
+    {"mqtt-topic-hostname",             required_argument, 0, 0},
     {"mqtt-tls-insecure",               required_argument, 0, 0},
     {"mqtt-reconnect-delay",            required_argument, 0, 0},
     {"mqtt-reconnect-delay-max",        required_argument, 0, 0},
@@ -480,6 +481,7 @@ const config_option_help_t config_options_help[] = {
     {"mqtt-client",                     "MQTT client ID (default: " MQTT_CLIENT_DEFAULT ")"},
     {"mqtt-server",                     "MQTT server URL (default: " MQTT_SERVER_DEFAULT ")"},
     {"mqtt-topic-prefix",               "MQTT topic prefix (default: " MQTT_TOPIC_PREFIX_DEFAULT ")"},
+    {"mqtt-topic-hostname",             "append /<hostname> to the topic (true/false, default: true)"},
     {"mqtt-tls-insecure",               "MQTT disable TLS verification (true/false)"},
     {"mqtt-reconnect-delay",            "MQTT reconnect delay in seconds (default: 5)"},
     {"mqtt-reconnect-delay-max",        "MQTT max reconnect delay in seconds (default: 60)"},
@@ -517,6 +519,7 @@ typedef struct {
 
 typedef struct {
     const char *mqtt_topic_prefix;
+    bool mqtt_topic_hostname;
     mqtt_config_t mqtt_config;
     mqtt_context_t mqtt_ctx;
     time_t interval_platform;
@@ -1743,10 +1746,17 @@ static bool publish_json(const char *type, cJSON *json) {
         cJSON_Delete(json);
         return false;
     }
-    char topic[TOPIC_MAX], hostname[64];
-    if (gethostname(hostname, sizeof(hostname)) != 0)
-        snprintf(hostname, sizeof(hostname), "unknown");
-    const bool ok = mqtt_send(&state.mqtt_ctx, snprintf_inline(topic, sizeof(topic), "%s/%s", state.mqtt_topic_prefix, hostname), str, (int)strlen(str));
+    char topic[TOPIC_MAX];
+    const char *full_topic;
+    if (state.mqtt_topic_hostname) {
+        char hostname[64];
+        if (gethostname(hostname, sizeof(hostname)) != 0)
+            snprintf(hostname, sizeof(hostname), "unknown");
+        full_topic = snprintf_inline(topic, sizeof(topic), "%s/%s", state.mqtt_topic_prefix, hostname);
+    } else {
+        full_topic = snprintf_inline(topic, sizeof(topic), "%s", state.mqtt_topic_prefix);
+    }
+    const bool ok = mqtt_send(&state.mqtt_ctx, full_topic, str, (int)strlen(str));
     if (ok)
         last_publish_time = time(NULL);
     if (state.debug)
@@ -1847,6 +1857,7 @@ static bool config_setup(const int argc, char *argv[]) {
     snprintf(state.mqtt_ctx.log_prefix, sizeof(state.mqtt_ctx.log_prefix), "mqtt");
     mqtt_config_populate(&state.mqtt_config);
     state.mqtt_topic_prefix = config_get_string("mqtt-topic-prefix", MQTT_TOPIC_PREFIX_DEFAULT);
+    state.mqtt_topic_hostname = config_get_bool("mqtt-topic-hostname", true);
     state.interval_platform = (time_t)config_get_integer("interval-platform", INTERVAL_PLATFORM_DEFAULT);
     state.interval_system = (time_t)config_get_integer("interval-system", INTERVAL_SYSTEM_DEFAULT);
     const char *processes_csv = config_get_string("check-processes", NULL);
