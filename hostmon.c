@@ -443,6 +443,7 @@ static cJSON *mqtttopics_build_json(mqtttopics_state_t *state) {
 #define MQTT_TLS_DEFAULT                 false
 #define MQTT_SYNCHRONOUS_DEFAULT         true
 #define MQTT_TOPIC_PREFIX_DEFAULT        "system/monitor"
+#define MQTT_TOPIC_HOSTNAME_DEFAULT      true
 #define MQTT_RECONNECT_DELAY_DEFAULT     5
 #define MQTT_RECONNECT_DELAY_MAX_DEFAULT 60
 
@@ -1857,7 +1858,7 @@ static bool config_setup(const int argc, char *argv[]) {
     snprintf(state.mqtt_ctx.log_prefix, sizeof(state.mqtt_ctx.log_prefix), "mqtt");
     mqtt_config_populate(&state.mqtt_config);
     state.mqtt_topic_prefix = config_get_string("mqtt-topic-prefix", MQTT_TOPIC_PREFIX_DEFAULT);
-    state.mqtt_topic_hostname = config_get_bool("mqtt-topic-hostname", true);
+    state.mqtt_topic_hostname = config_get_bool("mqtt-topic-hostname", MQTT_TOPIC_HOSTNAME_DEFAULT);
     state.interval_platform = (time_t)config_get_integer("interval-platform", INTERVAL_PLATFORM_DEFAULT);
     state.interval_system = (time_t)config_get_integer("interval-system", INTERVAL_SYSTEM_DEFAULT);
     const char *processes_csv = config_get_string("check-processes", NULL);
