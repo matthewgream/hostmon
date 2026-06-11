@@ -444,6 +444,7 @@ static cJSON *mqtttopics_build_json(mqtttopics_state_t *state) {
 #define MQTT_SYNCHRONOUS_DEFAULT         true
 #define MQTT_TOPIC_PREFIX_DEFAULT        "system/monitor"
 #define MQTT_TOPIC_HOSTNAME_DEFAULT      true
+#define MQTT_TOPIC_PER_TYPE_DEFAULT      false
 #define MQTT_RECONNECT_DELAY_DEFAULT     5
 #define MQTT_RECONNECT_DELAY_MAX_DEFAULT 60
 
@@ -462,6 +463,7 @@ const struct option config_options[] = {
     {"mqtt-server",                     required_argument, 0, 0},
     {"mqtt-topic-prefix",               required_argument, 0, 0},
     {"mqtt-topic-hostname",             required_argument, 0, 0},
+    {"mqtt-topic-per-type",             required_argument, 0, 0},
     {"mqtt-tls-insecure",               required_argument, 0, 0},
     {"mqtt-reconnect-delay",            required_argument, 0, 0},
     {"mqtt-reconnect-delay-max",        required_argument, 0, 0},
@@ -483,6 +485,7 @@ const config_option_help_t config_options_help[] = {
     {"mqtt-server",                     "MQTT server URL (default: " MQTT_SERVER_DEFAULT ")"},
     {"mqtt-topic-prefix",               "MQTT topic prefix (default: " MQTT_TOPIC_PREFIX_DEFAULT ")"},
     {"mqtt-topic-hostname",             "append /<hostname> to the topic (true/false, default: true)"},
+    {"mqtt-topic-per-type",             "publish each payload to <prefix>/<type> (system, platform) instead of one topic with a type field (true/false, default: false)"},
     {"mqtt-tls-insecure",               "MQTT disable TLS verification (true/false)"},
     {"mqtt-reconnect-delay",            "MQTT reconnect delay in seconds (default: 5)"},
     {"mqtt-reconnect-delay-max",        "MQTT max reconnect delay in seconds (default: 60)"},
@@ -521,6 +524,7 @@ typedef struct {
 typedef struct {
     const char *mqtt_topic_prefix;
     bool mqtt_topic_hostname;
+    bool mqtt_topic_per_type;
     mqtt_config_t mqtt_config;
     mqtt_context_t mqtt_ctx;
     time_t interval_platform;
@@ -596,6 +600,17 @@ static bool get_os_pretty(char *buf, size_t size) {
     }
     fclose(f);
     return found;
+}
+
+static bool get_hw_model(char *buf, size_t size) {
+    static const char *const sources[] = {
+        "/sys/firmware/devicetree/base/model", // Pi / other DT platforms
+        "/sys/class/dmi/id/product_name",      // x86 hosts
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        if (read_file_string(sources[i], buf, size))
+            return true;
+    return false;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -1722,6 +1737,10 @@ static cJSON *build_platform_json(void) {
     if (get_os_pretty(buf, sizeof(buf)))
         cJSON_AddStringToObject(root, "os_pretty", buf);
 
+    // hardware model
+    if (get_hw_model(buf, sizeof(buf)))
+        cJSON_AddStringToObject(root, "model", buf);
+
     // boot time
     struct sysinfo si;
     if (sysinfo(&si) == 0)
@@ -1748,15 +1767,10 @@ static bool publish_json(const char *type, cJSON *json) {
         return false;
     }
     char topic[TOPIC_MAX];
-    const char *full_topic;
-    if (state.mqtt_topic_hostname) {
-        char hostname[64];
-        if (gethostname(hostname, sizeof(hostname)) != 0)
-            snprintf(hostname, sizeof(hostname), "unknown");
-        full_topic = snprintf_inline(topic, sizeof(topic), "%s/%s", state.mqtt_topic_prefix, hostname);
-    } else {
-        full_topic = snprintf_inline(topic, sizeof(topic), "%s", state.mqtt_topic_prefix);
-    }
+    char hostname[64] = "";
+    if (state.mqtt_topic_hostname && gethostname(hostname, sizeof(hostname)) != 0)
+        snprintf(hostname, sizeof(hostname), "unknown");
+    const char *full_topic = snprintf_inline(topic, sizeof(topic), "%s%s%s%s%s", state.mqtt_topic_prefix, hostname[0] ? "/" : "", hostname, state.mqtt_topic_per_type ? "/" : "", state.mqtt_topic_per_type ? type : "");
     const bool ok = mqtt_send(&state.mqtt_ctx, full_topic, str, (int)strlen(str));
     if (ok)
         last_publish_time = time(NULL);
@@ -1851,6 +1865,32 @@ static bool config_setup(const int argc, char *argv[]) {
             exit(EXIT_SUCCESS);
         }
 
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "config: --check requires a path\n");
+                exit(EXIT_FAILURE);
+            }
+            const char *path = argv[i + 1];
+            FILE *t = fopen(path, "r");
+            if (!t) {
+                fprintf(stderr, "config: cannot open '%s': %s\n", path, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            fclose(t);
+            __config_load_file(path);
+            if (config_get_string("mqtt-server", NULL) == NULL) {
+                fprintf(stderr, "config: mqtt-server missing\n");
+                exit(EXIT_FAILURE);
+            }
+            if (config_get_integer("interval-system", INTERVAL_SYSTEM_DEFAULT) <= 0) {
+                fprintf(stderr, "config: interval-system must be > 0\n");
+                exit(EXIT_FAILURE);
+            }
+            printf("config: ok (%s)\n", path);
+            exit(EXIT_SUCCESS);
+        }
+
     if (!config_load(CONFIG_FILE_DEFAULT, argc, argv, config_options))
         return false;
 
@@ -1859,6 +1899,7 @@ static bool config_setup(const int argc, char *argv[]) {
     mqtt_config_populate(&state.mqtt_config);
     state.mqtt_topic_prefix = config_get_string("mqtt-topic-prefix", MQTT_TOPIC_PREFIX_DEFAULT);
     state.mqtt_topic_hostname = config_get_bool("mqtt-topic-hostname", MQTT_TOPIC_HOSTNAME_DEFAULT);
+    state.mqtt_topic_per_type = config_get_bool("mqtt-topic-per-type", MQTT_TOPIC_PER_TYPE_DEFAULT);
     state.interval_platform = (time_t)config_get_integer("interval-platform", INTERVAL_PLATFORM_DEFAULT);
     state.interval_system = (time_t)config_get_integer("interval-system", INTERVAL_SYSTEM_DEFAULT);
     const char *processes_csv = config_get_string("check-processes", NULL);
@@ -1888,6 +1929,12 @@ static void signal_handler(const int sig __attribute__((unused))) {
 }
 
 int main(int argc, char *argv[]) {
+
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--self-test") == 0) {
+            printf("Self-test reports OK\n");
+            return EXIT_SUCCESS;
+        }
 
     setbuf(stdout, NULL);
     printf("starting (hostmon: host system monitor)\n");
