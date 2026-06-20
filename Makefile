@@ -32,6 +32,9 @@ LIBS=-lcjson -lmosquitto -lm
 ##
 
 TARGET=hostmon
+# native = bare; cross = $(TARGET).<arch> via SUFFIX (the iotdata toolchain Makefile passes it).
+SUFFIX ?=
+BIN=$(TARGET)$(SUFFIX)
 MAIN=hostmon.c
 SOURCES=\
     config_linux.h mqtt_linux.h
@@ -40,13 +43,13 @@ CFG_SRC:=$(if $(wildcard $(TARGET).$(HOSTNAME).cfg),$(TARGET).$(HOSTNAME).cfg,$(
 
 ##
 
-all: $(TARGET)
+all: $(BIN)
 
-$(TARGET): $(MAIN) $(SOURCES)
-	$(CC) $(CFLAGS) -o $(TARGET) $(MAIN) $(LDFLAGS) $(LIBS)
+$(BIN): $(MAIN) $(SOURCES)
+	$(CC) $(CFLAGS) -o $(BIN) $(MAIN) $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f $(TARGET) $(TARGET).armhf
+	rm -f $(TARGET) $(BIN) $(TARGET).armhf
 format:
 	clang-format -i $(MAIN) $(SOURCES)
 test: $(TARGET)
