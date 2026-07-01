@@ -1,5 +1,5 @@
 [Unit]
-Description=hostmon — host system monitor
+Description=hostmon - host system monitor
 After=network-online.target mosquitto.service
 Wants=network-online.target
 
