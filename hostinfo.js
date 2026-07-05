@@ -54,18 +54,28 @@ Arguments:
 const data = {}; // { hostname: { platform: {}, system: {} } }
 
 function onMessage(topic, payload) {
-    const parts = topic.split('/');
-    if (parts.length < 3) return;
-    const hostname = parts[parts.length - 2];
-    const type = parts[parts.length - 1];
-    if (type !== 'platform' && type !== 'system') return;
-    if (opts.hosts.length > 0 && !opts.hosts.some((h) => hostname.toLowerCase().startsWith(h))) return;
+    let obj;
     try {
-        if (!data[hostname]) data[hostname] = {};
-        data[hostname][type] = JSON.parse(payload.toString());
+        obj = JSON.parse(payload.toString());
     } catch (_) {
-        /* ignore parse errors */
+        return; /* ignore parse errors */
     }
+    // Type comes from the payload so we work with either topic layout:
+    //   single-topic:  <prefix>/<host>          (type field in the JSON, hostmon default)
+    //   per-type:      <prefix>/<host>/<type>   (mqtt-topic-per-type=true)
+    const type = obj.type;
+    if (type !== 'platform' && type !== 'system') return;
+    const parts = topic.split('/');
+    const last = parts[parts.length - 1];
+    const hostname = last === 'system' || last === 'platform' ? parts[parts.length - 2] : last;
+    if (!hostname) return;
+    if (opts.hosts.length > 0 && !opts.hosts.some((h) => hostname.toLowerCase().startsWith(h))) return;
+    if (!data[hostname]) data[hostname] = {};
+    // Both layouts may be retained at once (e.g. stale leftover per-type messages next to
+    // the live single-topic one). Keep whichever is newest by ISO8601 timestamp.
+    const prev = data[hostname][type];
+    if (prev && prev.timestamp && obj.timestamp && obj.timestamp < prev.timestamp) return;
+    data[hostname][type] = obj;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -130,6 +140,16 @@ function timeAge(ts) {
     const d = new Date(ts);
     const secs = Math.floor((Date.now() - d.getTime()) / 1000);
     return ago(secs) + ' ago';
+}
+
+// Age of the last received message, coloured by staleness so offline hosts stand out.
+function seenAge(ts) {
+    if (!ts) return `${C.red}?${C.reset}`;
+    const secs = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
+    const str = ago(secs);
+    if (secs > 3600) return `${C.red}${str}${C.reset}`; // > 1h: likely offline
+    if (secs > 900) return `${C.yellow}${str}${C.reset}`; // > 15m: missed updates
+    return `${C.dim}${str}${C.reset}`;
 }
 
 const SEP = '─';
@@ -235,6 +255,7 @@ function showSystemSummary(hosts) {
         ['NTP', 4],
         ['GW', 8],
         ['DNS', 4],
+        ['SEEN', 8],
     ];
     const hdr = cols.map(([n, w]) => pad(n, w)).join('  ');
     console.log(`${C.bold}${hdr}${C.reset}`);
@@ -279,6 +300,7 @@ function showSystemSummary(hosts) {
                 pad(indicator(ts.synchronized), cols[9][1]),
                 pad(gwStr, cols[10][1]),
                 pad(resolve.ok != null ? indicator(resolve.ok) : '-', cols[11][1]),
+                pad(seenAge(s.timestamp), cols[12][1]),
             ].join('  ')
         );
     }
