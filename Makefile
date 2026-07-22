@@ -57,7 +57,7 @@ format:
 test: $(TARGET)
 	./$(TARGET) --config $(CFG_SRC)
 
-DEV_PACKAGES=libjson-c-dev libmosquitto-dev
+DEV_PACKAGES=libmosquitto-dev libjson-c-dev
 DEV_PACKAGES_ARMHF=$(addsuffix :armhf,$(DEV_PACKAGES))
 install-dev:
 	apt install -y $(DEV_PACKAGES)
