@@ -27,7 +27,7 @@ CFLAGS_COMMON=\
 CFLAGS_OPT=-O3
 CFLAGS=$(CFLAGS_COMMON) $(CFLAGS_OPT)
 LDFLAGS=
-LIBS=-lcjson -lmosquitto -lm -lpthread
+LIBS=-ljson-c -lmosquitto -lm -lpthread
 
 ##
 
@@ -57,7 +57,7 @@ format:
 test: $(TARGET)
 	./$(TARGET) --config $(CFG_SRC)
 
-DEV_PACKAGES=libcjson-dev libmosquitto-dev
+DEV_PACKAGES=libjson-c-dev libmosquitto-dev
 DEV_PACKAGES_ARMHF=$(addsuffix :armhf,$(DEV_PACKAGES))
 install-dev:
 	apt install -y $(DEV_PACKAGES)

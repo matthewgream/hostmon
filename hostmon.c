@@ -58,7 +58,44 @@
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 
-#include <cjson/cJSON.h>
+#include <json-c/json.h>
+
+// hostmon builds its MQTT JSON payloads with the cJSON builder API. The project standardises on json-c (as trafmon and
+// connmon do), so rather than rewrite ~180 call sites, these thin wrappers reimplement exactly the slice of the cJSON
+// builder API that hostmon uses, backed by json-c. hostmon only *builds* JSON (it never parses or touches struct
+// fields), so no parse/accessor surface is required. Number output matches cJSON: an integral value is emitted as a
+// JSON integer, a fractional value as a double (cJSON likewise prints an integral double with no decimal point).
+typedef struct json_object cJSON;
+static cJSON *cJSON_CreateObject(void) { return json_object_new_object(); }
+static cJSON *cJSON_CreateArray(void) { return json_object_new_array(); }
+static void cJSON_AddItemToObject(cJSON *obj, const char *key, cJSON *item) { json_object_object_add(obj, key, item); }
+static void cJSON_AddItemToArray(cJSON *arr, cJSON *item) { json_object_array_add(arr, item); }
+static cJSON *cJSON_AddObjectToObject(cJSON *obj, const char *key) {
+    cJSON *child = json_object_new_object();
+    json_object_object_add(obj, key, child);
+    return child;
+}
+static cJSON *cJSON_AddArrayToObject(cJSON *obj, const char *key) {
+    cJSON *child = json_object_new_array();
+    json_object_object_add(obj, key, child);
+    return child;
+}
+static void cJSON_AddStringToObject(cJSON *obj, const char *key, const char *val) { json_object_object_add(obj, key, json_object_new_string(val ? val : "")); }
+static void cJSON_AddBoolToObject(cJSON *obj, const char *key, bool val) { json_object_object_add(obj, key, json_object_new_boolean(val)); }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+static void cJSON_AddNumberToObject(cJSON *obj, const char *key, double val) {
+    if (val >= -9223372036854775000.0 && val <= 9223372036854775000.0 && val == (double)(int64_t)val) // integral & in int64 range
+        json_object_object_add(obj, key, json_object_new_int64((int64_t)val));
+    else
+        json_object_object_add(obj, key, json_object_new_double(val));
+}
+#pragma GCC diagnostic pop
+static char *cJSON_PrintUnformatted(cJSON *obj) { // returns a heap copy the caller frees, matching the cJSON contract
+    const char *s = json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN);
+    return s ? strdup(s) : NULL;
+}
+static void cJSON_Delete(cJSON *obj) { json_object_put(obj); }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
