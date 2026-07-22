@@ -85,10 +85,20 @@ static void cJSON_AddBoolToObject(cJSON *obj, const char *key, bool val) { json_
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wfloat-equal"
 static void cJSON_AddNumberToObject(cJSON *obj, const char *key, double val) {
-    if (val >= -9223372036854775000.0 && val <= 9223372036854775000.0 && val == (double)(int64_t)val) // integral & in int64 range
+    if (!isfinite(val)) {
+        json_object_object_add(obj, key, NULL); // JSON null, as cJSON emits for NaN/Inf
+    } else if (val >= -9223372036854775000.0 && val <= 9223372036854775000.0 && val == (double)(int64_t)val) { // integral & in int64 range
         json_object_object_add(obj, key, json_object_new_int64((int64_t)val));
-    else
-        json_object_object_add(obj, key, json_object_new_double(val));
+    } else {
+        // Reproduce cJSON's number printer: shortest form that round-trips (15 sig figs, else 17), so the emitted JSON
+        // is byte-identical to the previous cJSON output rather than json-c's default full-precision form.
+        char buf[32];
+        double rt;
+        snprintf(buf, sizeof(buf), "%.15g", val);
+        if (sscanf(buf, "%lg", &rt) != 1 || rt != val)
+            snprintf(buf, sizeof(buf), "%.17g", val);
+        json_object_object_add(obj, key, json_object_new_double_s(val, buf));
+    }
 }
 #pragma GCC diagnostic pop
 static char *cJSON_PrintUnformatted(cJSON *obj) { // returns a heap copy the caller frees, matching the cJSON contract
