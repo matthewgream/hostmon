@@ -45,6 +45,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <stdarg.h>
+#include <pthread.h>
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -183,6 +184,7 @@ typedef struct {
     mqtt_context_t mqtt_ctx;
     int subscription_count;
     mqtttopics_sub_t subscriptions[MQTTTOPICS_MAX_SUBS];
+    pthread_mutex_t lock; // guards subscription stats/buckets: written by the loop-thread message callback, read by main-thread build_json
 } mqtttopics_state_t;
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -291,6 +293,7 @@ static void __mqtttopics_message_handler(void *user_data, const char *topic, con
         return;
     const time_t now = time(NULL);
     const uint32_t hash = __mqtttopics_hash_create(topic);
+    pthread_mutex_lock(&state->lock);
     for (int i = 0; i < state->subscription_count; i++) {
         mqtttopics_sub_t *sub = &state->subscriptions[i];
         bool match = false;
@@ -302,14 +305,17 @@ static void __mqtttopics_message_handler(void *user_data, const char *topic, con
             __mqtttopics_bucket_record(sub, now);
         }
     }
+    pthread_mutex_unlock(&state->lock);
 }
 
 static void __mqtttopics_connect_handler(void *user_data, bool connected) {
     mqtttopics_state_t *state = (mqtttopics_state_t *)user_data;
     if (!state)
         return;
+    pthread_mutex_lock(&state->lock);
     for (int i = 0; i < state->subscription_count; i++)
         state->subscriptions[i].subscribed = connected && mqtt_subscribe(&state->mqtt_ctx, state->subscriptions[i].topic, 0);
+    pthread_mutex_unlock(&state->lock);
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -342,7 +348,11 @@ static bool mqtttopics_setup(mqtttopics_state_t *state, const char *config_value
         snprintf(state->server_buf, sizeof(state->server_buf), "%s", MQTTTOPICS_SERVER_DEFAULT);
     state->mqtt_config.server = state->server_buf;
     state->mqtt_config.client = snprintf_inline(state->client_id_buf, sizeof(state->client_id_buf), "%s%s", client_base ? client_base : "hostmon", MQTTTOPICS_CLIENT_SUFFIX);
-    state->mqtt_config.use_synchronous = true;
+    // Run the subscriber on libmosquitto's own network thread (mosquitto_loop_start). A pure subscriber sends nothing,
+    // so its liveness depends entirely on the keepalive PINGREQ/PINGRESP cycle; driving it from the shared synchronous
+    // main loop was letting that cycle lapse and the client self-disconnected with MOSQ_ERR_KEEPALIVE (rc=19) every 2x
+    // keepalive. The publisher never hit this because every publish pushes its keepalive forward. Async decouples it.
+    state->mqtt_config.use_synchronous = false;
     state->mqtt_config.tls_insecure = false;
     state->mqtt_config.reconnect_delay = MQTTTOPICS_RECONNECT_DELAY;
     state->mqtt_config.reconnect_delay_max = MQTTTOPICS_RECONNECT_DELAY_MAX;
@@ -370,6 +380,7 @@ static bool mqtttopics_setup(mqtttopics_state_t *state, const char *config_value
         fprintf(stderr, "check-topics: no topics configured, disabling\n");
         return false;
     }
+    pthread_mutex_init(&state->lock, NULL);
     state->enabled = true;
     printf("check-topics: configured (server='%s', client='%s', topics=%d)\n", state->server_buf, state->client_id_buf, state->subscription_count);
     for (int i = 0; i < state->subscription_count; i++)
@@ -395,7 +406,8 @@ static bool mqtttopics_init(mqtttopics_state_t *state) {
 static void mqtttopics_loop(mqtttopics_state_t *state, int timeout_ms) {
     if (!state->enabled)
         return;
-    mqtt_loop(&state->mqtt_ctx, timeout_ms);
+    if (state->mqtt_ctx.synchronous) // async subscriber is pumped by libmosquitto's own loop thread; nothing to do here
+        mqtt_loop(&state->mqtt_ctx, timeout_ms);
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -404,6 +416,7 @@ static void mqtttopics_term(mqtttopics_state_t *state) {
     if (!state->enabled)
         return;
     mqtt_end(&state->mqtt_ctx);
+    pthread_mutex_destroy(&state->lock);
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -413,6 +426,7 @@ static cJSON *mqtttopics_build_json(mqtttopics_state_t *state) {
         return NULL;
     cJSON *arr = cJSON_CreateArray();
     const time_t now = time(NULL);
+    pthread_mutex_lock(&state->lock);
     for (int i = 0; i < state->subscription_count; i++) {
         mqtttopics_sub_t *sub = &state->subscriptions[i];
         cJSON *obj = cJSON_CreateObject();
@@ -437,6 +451,7 @@ static cJSON *mqtttopics_build_json(mqtttopics_state_t *state) {
         cJSON_AddNumberToObject(messages, "72h", __mqtttopics_rate_window(sub, now, 72 * 60 * 60));
         cJSON_AddItemToArray(arr, obj);
     }
+    pthread_mutex_unlock(&state->lock);
     return arr;
 }
 
