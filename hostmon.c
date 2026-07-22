@@ -130,10 +130,19 @@ volatile bool running = true;
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-#define MQTT_CONNECT_TIMEOUT 60
+#define MQTT_CONNECT_TIMEOUT 120 // keepalive (s); headroom so a slow check cycle can't trip MOSQ_ERR_KEEPALIVE (rc=19)
 #define MQTT_PUBLISH_QOS     0
 #define MQTT_PUBLISH_RETAIN  true
 #include "mqtt_linux.h"
+
+// Hard timeouts (seconds) for the external/network probes that run inline on the single-threaded main loop. Without
+// these, a down uplink makes getaddrinfo()/dbus/subprocesses block for a minute or more, starving the MQTT keepalive on
+// both the publisher and check-topics connections and producing rc=19 disconnect/reconnect churn.
+#define CHECK_RESOLVE_TIMEOUT_SECS  3
+#define CHECK_GATEWAY_TIMEOUT_SECS  5
+#define CHECK_TIMESYNC_TIMEOUT_SECS 3
+#define XSTR_(x) #x
+#define STR(x)   XSTR_(x) // stringify a numeric #define for use inside a string literal
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -553,7 +562,7 @@ static bool ping_host(const char *host, double *rtt_ms) {
     if (rtt_ms)
         *rtt_ms = -1.0;
     char cmd[160];
-    FILE *f = popen(snprintf_inline(cmd, sizeof(cmd), "ping -c1 -W2 %s 2>/dev/null", host), "r");
+    FILE *f = popen(snprintf_inline(cmd, sizeof(cmd), "timeout %d ping -c1 -W2 %s 2>/dev/null", CHECK_GATEWAY_TIMEOUT_SECS, host), "r");
     if (!f)
         return false;
     char line[256];
@@ -866,11 +875,12 @@ static cJSON *timesync_build_json(void) {
 
     // try timedatectl (systemd-timesyncd)
     char buf[32];
-    if (read_pipe_string("timedatectl show --property=NTPSynchronized --value 2>/dev/null", buf, sizeof(buf)))
+    // `timeout` guards against timedatectl (dbus/systemd) or chronyc hanging and stalling the main loop / MQTT keepalive.
+    if (read_pipe_string("timeout " STR(CHECK_TIMESYNC_TIMEOUT_SECS) " timedatectl show --property=NTPSynchronized --value 2>/dev/null", buf, sizeof(buf)))
         cJSON_AddBoolToObject(timesync, "synchronized", strcmp(buf, "yes") == 0);
 
     // try chronyc for offset
-    FILE *f = popen("chronyc tracking 2>/dev/null", "r");
+    FILE *f = popen("timeout " STR(CHECK_TIMESYNC_TIMEOUT_SECS) " chronyc tracking 2>/dev/null", "r");
     if (f) {
         char line[256];
         bool found_source = false;
@@ -1504,13 +1514,24 @@ static bool check_resolve_dns_name(const char *hostname, char *result_ip, size_t
     result_ip[0] = '\0';
     if (!hostname || !*hostname)
         return false;
-    const struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(hostname, NULL, &hints, &res) != 0)
+    // Only accept plain hostname characters: the name is interpolated into a shell command below, and this also rejects
+    // anything that isn't a resolvable host.
+    for (const char *p = hostname; *p; p++)
+        if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '-' || *p == '_'))
+            return false;
+    // getaddrinfo() has no timeout and can block the single-threaded main loop for a minute or more when the uplink is
+    // down (resolver timeout x attempts x search-domain expansion), starving the MQTT keepalive. Cap it hard via
+    // `timeout` + getent, which uses the same NSS resolver but is killed after CHECK_RESOLVE_TIMEOUT_SECS.
+    char cmd[128];
+    snprintf_inline(cmd, sizeof(cmd), "timeout %d getent ahostsv4 %s 2>/dev/null", CHECK_RESOLVE_TIMEOUT_SECS, hostname);
+    char line[256];
+    if (!read_pipe_string(cmd, line, sizeof(line))) // "142.250.66.238  STREAM google.com" (first token is the IP)
         return false;
-    if (res && res->ai_addr)
-        inet_ntop(AF_INET, &((const struct sockaddr_in *)res->ai_addr)->sin_addr, result_ip, (socklen_t)result_size);
-    freeaddrinfo(res);
+    char ip[64];
+    struct in_addr tmp;
+    if (sscanf(line, "%63s", ip) != 1 || inet_pton(AF_INET, ip, &tmp) != 1)
+        return false;
+    string_memcpy(result_ip, result_size, ip);
     return result_ip[0] != '\0';
 }
 
