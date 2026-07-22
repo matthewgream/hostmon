@@ -66,10 +66,18 @@
 // fields), so no parse/accessor surface is required. Number output matches cJSON: an integral value is emitted as a
 // JSON integer, a fractional value as a double (cJSON likewise prints an integral double with no decimal point).
 typedef struct json_object cJSON;
-static cJSON *cJSON_CreateObject(void) { return json_object_new_object(); }
-static cJSON *cJSON_CreateArray(void) { return json_object_new_array(); }
-static void cJSON_AddItemToObject(cJSON *obj, const char *key, cJSON *item) { json_object_object_add(obj, key, item); }
-static void cJSON_AddItemToArray(cJSON *arr, cJSON *item) { json_object_array_add(arr, item); }
+static cJSON *cJSON_CreateObject(void) {
+    return json_object_new_object();
+}
+static cJSON *cJSON_CreateArray(void) {
+    return json_object_new_array();
+}
+static void cJSON_AddItemToObject(cJSON *obj, const char *key, cJSON *item) {
+    json_object_object_add(obj, key, item);
+}
+static void cJSON_AddItemToArray(cJSON *arr, cJSON *item) {
+    json_object_array_add(arr, item);
+}
 static cJSON *cJSON_AddObjectToObject(cJSON *obj, const char *key) {
     cJSON *child = json_object_new_object();
     json_object_object_add(obj, key, child);
@@ -80,13 +88,17 @@ static cJSON *cJSON_AddArrayToObject(cJSON *obj, const char *key) {
     json_object_object_add(obj, key, child);
     return child;
 }
-static void cJSON_AddStringToObject(cJSON *obj, const char *key, const char *val) { json_object_object_add(obj, key, json_object_new_string(val ? val : "")); }
-static void cJSON_AddBoolToObject(cJSON *obj, const char *key, bool val) { json_object_object_add(obj, key, json_object_new_boolean(val)); }
+static void cJSON_AddStringToObject(cJSON *obj, const char *key, const char *val) {
+    json_object_object_add(obj, key, json_object_new_string(val ? val : ""));
+}
+static void cJSON_AddBoolToObject(cJSON *obj, const char *key, bool val) {
+    json_object_object_add(obj, key, json_object_new_boolean(val));
+}
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wfloat-equal"
 static void cJSON_AddNumberToObject(cJSON *obj, const char *key, double val) {
     if (!isfinite(val)) {
-        json_object_object_add(obj, key, NULL); // JSON null, as cJSON emits for NaN/Inf
+        json_object_object_add(obj, key, NULL);                                                                // JSON null, as cJSON emits for NaN/Inf
     } else if (val >= -9223372036854775000.0 && val <= 9223372036854775000.0 && val == (double)(int64_t)val) { // integral & in int64 range
         json_object_object_add(obj, key, json_object_new_int64((int64_t)val));
     } else {
@@ -105,7 +117,9 @@ static char *cJSON_PrintUnformatted(cJSON *obj) { // returns a heap copy the cal
     const char *s = json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN);
     return s ? strdup(s) : NULL;
 }
-static void cJSON_Delete(cJSON *obj) { json_object_put(obj); }
+static void cJSON_Delete(cJSON *obj) {
+    json_object_put(obj);
+}
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -186,11 +200,11 @@ volatile bool running = true;
 // Hard timeouts (seconds) for the external/network probes that run inline on the single-threaded main loop. Without
 // these, a down uplink makes getaddrinfo()/dbus/subprocesses block for a minute or more, starving the MQTT keepalive on
 // both the publisher and check-topics connections and producing rc=19 disconnect/reconnect churn.
-#define CHECK_RESOLVE_TIMEOUT_SECS  3
-#define CHECK_GATEWAY_TIMEOUT_SECS  5
-#define CHECK_TIMESYNC_TIMEOUT_SECS 3
-#define XSTR_(x) #x
-#define STR(x)   XSTR_(x) // stringify a numeric #define for use inside a string literal
+#define CHECK_RESOLVE_TIMEOUT_SECS     3
+#define CHECK_GATEWAY_TIMEOUT_SECS     5
+#define CHECK_TIMESYNC_TIMEOUT_SECS    3
+#define XSTR_(x)                       #x
+#define STR(x)                         XSTR_(x) // stringify a numeric #define for use inside a string literal
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------

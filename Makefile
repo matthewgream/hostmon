@@ -53,7 +53,7 @@ $(BIN): $(MAIN) $(SOURCES)
 clean:
 	rm -f $(TARGET) $(BIN) $(TARGET).armhf
 format:
-	clang-format -i $(MAIN) $(SOURCES)
+	clang-format-19 -i $(MAIN) $(SOURCES)
 test: $(TARGET)
 	./$(TARGET) --config $(CFG_SRC)
 
